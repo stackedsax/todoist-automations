@@ -1,3 +1,56 @@
+function createTaskFromStarred() {
+  const todoistToken = PropertiesService.getScriptProperties().getProperty('TODOIST_API_TOKEN');
+  if (!todoistToken) throw new Error("Todoist API token not found. Run setTodoistToken() first.");
+
+  const threads = GmailApp.search('is:starred');
+
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+    if (!messages || messages.length === 0) return;
+
+    messages.forEach(message => {
+      if (!message || !message.isStarred()) return;
+
+      const subject = message.getSubject();
+      const messageId = message.getId();
+      const link = `https://mail.google.com/mail/u/0/?shva=1#inbox/${messageId}`;
+
+      const rawBody = extractCleanBodySimple(message);
+      const bodyText = cleanEmailBody(rawBody);
+
+      const payload = {
+        content: subject + ' @starred',
+        description: `[View original email](${link})\n\n${bodyText}`
+      };
+
+      const response = UrlFetchApp.fetch('https://api.todoist.com/api/v1/tasks', {
+        method: 'POST',
+        contentType: 'application/json',
+        headers: {
+          Authorization: `Bearer ${todoistToken}`
+        },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+
+      if (response.getResponseCode() !== 200) {
+        console.log('Error response:', response.getContentText());
+        throw new Error(`API request failed with code ${response.getResponseCode()}: ${response.getContentText()}`);
+      }
+
+      message.unstar();
+    });
+  });
+}
+
+function createTrigger() {
+  ScriptApp.newTrigger('createTaskFromStarred')
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+  console.log('Trigger created successfully - will run every minute');
+}
+
 function extractCleanBodySimple(message) {
   if (!message || typeof message.getPlainBody !== 'function') return '';
 
@@ -56,51 +109,4 @@ function cleanEmailBody(bodyText) {
 
   // Clean up spacing
   return bodyText.replace(/\n{3,}/g, '\n\n').trim();
-}
-
-function createTaskFromStarred() {
-  const todoistToken = PropertiesService.getScriptProperties().getProperty('TODOIST_API_TOKEN');
-  if (!todoistToken) throw new Error("Todoist API token not found. Run setTodoistToken() first.");
-
-  const threads = GmailApp.search('is:starred');
-
-  threads.forEach(thread => {
-    const messages = thread.getMessages();
-    if (!messages || messages.length === 0) return;
-
-    messages.forEach(message => {
-      if (!message || !message.isStarred()) return;
-
-      const subject = message.getSubject();
-      const messageId = message.getId();
-      const link = `https://mail.google.com/mail/u/0/?shva=1#inbox/${messageId}`;
-
-      const rawBody = extractCleanBodySimple(message);
-      const bodyText = cleanEmailBody(rawBody);
-
-      const payload = {
-        content: subject + ' @starred',
-        description: `[View original email](${link})\n\n${bodyText}`
-      };
-
-      UrlFetchApp.fetch('https://api.todoist.com/rest/v2/tasks', {
-        method: 'POST',
-        contentType: 'application/json',
-        headers: {
-          Authorization: `Bearer ${todoistToken}`
-        },
-        payload: JSON.stringify(payload)
-      });
-
-      message.unstar();
-    });
-  });
-}
-
-function createTrigger() {
-  ScriptApp.newTrigger('createTaskFromStarred')
-    .timeBased()
-    .everyMinutes(1)
-    .create();
-  console.log('Trigger created successfully - will run every minute');
 }
