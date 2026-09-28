@@ -141,7 +141,7 @@ function waitingItem(over) {
 
 function setup(opts) {
   const o = opts || {};
-  const ctx = loadGas(FILES, { props: Object.assign({}, PROPS, o.props || {}), timeZone: 'America/Los_Angeles' });
+  const ctx = loadGas(o.files || FILES, { props: Object.assign({}, PROPS, o.props || {}), timeZone: 'America/Los_Angeles' });
   ctx.Util.now = () => new Date(NOW.getTime());
   ctx.Http.jitter_ = () => 0;
   const todo = fakeTodoist(ctx.__mocks, {
@@ -597,6 +597,269 @@ describe('triageAct undo', () => {
   });
 });
 
+// ------------------------------------------------------------------ review fixes
+
+describe('feedback withdrawal round trip with Dedupe', () => {
+  // A title pair Dedupe.matchTask really matches (containment 1.0), so suppression is observable.
+  const DUP_TASK = { id: 't_utsa2', content: 'Review the UTSA doc for Marcus', project_id: 'p_isc' };
+  const mk = () => {
+    const { ctx } = setup({
+      files: FILES.concat(['Dedupe.js']),
+      tasks: [DUP_TASK],
+      items: [emailDupItem({ dupTaskId: 't_utsa2', dupTaskTitle: DUP_TASK.content })]
+    });
+    let t = NOW.getTime();
+    ctx.Util.now = () => new Date(t);
+    const tick = () => { t += 60000; };
+    // The two ways callers load feedback: Meetings/Slack (type filter) and Dedupe.notDuplicateFeedback.
+    const match = () => ({
+      typed: ctx.Dedupe.matchTask({ id: 'q_mail1', title: emailDupItem().title }, [DUP_TASK], ctx.Store.feedbackRecent(200, 'not_duplicate')),
+      mixed: ctx.Dedupe.matchTask({ id: 'q_mail1', title: emailDupItem().title }, [DUP_TASK], ctx.Dedupe.notDuplicateFeedback())
+    });
+    return { ctx, tick, match };
+  };
+  const ids = m => [m.typed ? m.typed.taskId : null, m.mixed ? m.mixed.taskId : null];
+
+  test('baseline: the pair matches, u suppresses it', () => {
+    const { ctx, match } = mk();
+    expect(ids(match())).toEqual(['t_utsa2', 't_utsa2']);
+    ctx.triageAct('q_mail1', 'undup');
+    expect(ids(match())).toEqual([null, null]);
+  });
+
+  test('u then u: clearing the flag un-suppresses the pair', () => {
+    const { ctx, tick, match } = mk();
+    ctx.triageAct('q_mail1', 'undup');
+    tick();
+    ctx.triageAct('q_mail1', 'undup');
+    expect(ids(match())).toEqual(['t_utsa2', 't_utsa2']);
+  });
+
+  test('u then z: undoing the flag un-suppresses the pair', () => {
+    const { ctx, tick, match } = mk();
+    ctx.triageAct('q_mail1', 'undup');
+    tick();
+    ctx.triageAct('q_mail1', 'undo');
+    expect(ctx.Store.queueGet('q_mail1').notDuplicate).toBe(false);
+    expect(ids(match())).toEqual(['t_utsa2', 't_utsa2']);
+    expect(feedback(ctx, 'undone').length).toBe(0); // state rows, not 'undone', for undup
+  });
+
+  test('u, u, z: undoing the clear suppresses the pair again', () => {
+    const { ctx, tick, match } = mk();
+    ctx.triageAct('q_mail1', 'undup');
+    tick();
+    ctx.triageAct('q_mail1', 'undup');
+    tick();
+    ctx.triageAct('q_mail1', 'undo');
+    expect(ctx.Store.queueGet('q_mail1').notDuplicate).toBe(true);
+    expect(ids(match())).toEqual([null, null]);
+  });
+
+  test('same-millisecond toggles still resolve newest-first', () => {
+    const { ctx, match } = mk();
+    ctx.Util.now = () => new Date(NOW.getTime());
+    ctx.triageAct('q_mail1', 'undup');
+    ctx.triageAct('q_mail1', 'undup');
+    expect(ids(match())).toEqual(['t_utsa2', 't_utsa2']);
+  });
+
+  test('undo of dismiss/edit/move writes an undone row whose detail.at equals the withdrawn rows\' at', () => {
+    const { ctx, tick } = mk();
+    ctx.triageAct('q_mail1', 'edit', { title: 'Review UTSA doc' });
+    tick();
+    ctx.triageAct('q_mail1', 'undo');
+    tick();
+    ctx.triageAct('q_mail1', 'dismiss');
+    tick();
+    ctx.triageAct('q_mail1', 'undo');
+    const dismissed = feedback(ctx, 'dismissed')[0];
+    const edited = feedback(ctx, 'edited')[0];
+    const undone = feedback(ctx, 'undone');
+    expect(undone.map(u => u.detail.action)).toEqual(['dismiss', 'edit']);
+    expect(undone[0].detail.at).toBe(dismissed.at);
+    expect(undone[1].detail.at).toBe(edited.at);
+    expect(undone.every(u => u.queueId === 'q_mail1')).toBe(true);
+  });
+
+  test('undo of an accept without edits writes no undone row; with edits it does', () => {
+    const { ctx } = setup();
+    ctx.triageAct('q_meet1', 'accept');
+    ctx.triageAct('q_meet1', 'undo');
+    expect(feedback(ctx, 'undone').length).toBe(0);
+    ctx.triageAct('q_meet1', 'accept', { title: 'Reissue C3 credentials' });
+    ctx.triageAct('q_meet1', 'undo');
+    expect(feedback(ctx, 'undone').map(u => u.detail.action)).toEqual(['accept']);
+  });
+});
+
+describe('no-op actions push no undo record', () => {
+  test('move to the current destination after u: changed false, and z undoes the undup', () => {
+    const { ctx } = setup();
+    ctx.triageAct('q_mail1', 'undup');
+    const res = ctx.triageAct('q_mail1', 'move', { project: 'ISC', section: 'Research' });
+    expect(res.changed).toBe(false);
+    expect(res.message).toMatch(/unchanged/);
+    expect(ctx.Store.queueGet('q_mail1').undo.map(r => r.action)).toEqual(['undup']);
+    const it = ctx.triageAct('q_mail1', 'undo').item;
+    expect(it.notDuplicate).toBe(false);
+    expect(it.project).toBe('ISC');
+    expect(() => ctx.triageAct('q_mail1', 'undo')).toThrow(/Nothing to undo/);
+  });
+
+  test('unchanged edit and undup-to-current-state report changed false; real actions report true', () => {
+    const { ctx } = setup();
+    expect(ctx.triageAct('q_meet1', 'edit', { title: meetingItem().title }).changed).toBe(false);
+    expect(ctx.triageAct('q_mail1', 'undup', { notDuplicate: false }).changed).toBe(false);
+    expect(ctx.Store.queueGet('q_meet1').undo).toBeUndefined();
+    expect(ctx.Store.queueGet('q_mail1').undo).toBeUndefined();
+    expect(ctx.triageAct('q_meet1', 'edit', { title: 'New title' }).changed).toBe(true);
+    expect(ctx.triageAct('q_meet1', 'undo').changed).toBe(true);
+    expect(ctx.triageAct('q_meet1', 'accept').changed).toBe(true);
+  });
+});
+
+describe('sections outage never drops a section', () => {
+  const outage = ctx => ctx.__mocks.UrlFetchApp.__on('GET', req => req.url.indexOf(BASE + '/sections') === 0, { status: 500, body: 'down' });
+
+  test('quick move while sections cannot load -> clear error, item unchanged, no feedback', () => {
+    const { ctx } = setup();
+    outage(ctx);
+    expect(() => ctx.triageAct('q_meet1', 'move', { project: 'GR' })).toThrow(/Could not load the Todoist sections for GR.*HTTP 500/);
+    expect(() => ctx.triageAct('q_meet1', 'move', { project: 'ISC' })).toThrow(/sections for ISC/);
+    const it = ctx.Store.queueGet('q_meet1');
+    expect(it).toMatchObject({ project: 'GR', section: 'Tech Projects' });
+    expect(it.undo).toBeUndefined();
+    expect(feedback(ctx, 'rerouted').length).toBe(0);
+  });
+
+  test('explicit section while sections cannot load -> error, not "does not exist"', () => {
+    const { ctx } = setup();
+    outage(ctx);
+    expect(() => ctx.triageAct('q_meet1', 'move', { project: 'Me', section: 'Immediate' })).toThrow(/Could not load the Todoist sections for Me/);
+  });
+
+  test('moves that need no section lookup still work (project root, Waiting, item without a section)', () => {
+    const { ctx } = setup({ items: [meetingItem(), meetingItem({ id: 'q_nosec', section: null })] });
+    outage(ctx);
+    expect(ctx.triageAct('q_meet1', 'move', { project: 'ISC', section: null }).item).toMatchObject({ project: 'ISC', section: null });
+    expect(ctx.triageAct('q_nosec', 'move', { project: 'Me' }).item).toMatchObject({ project: 'Me', section: null });
+    expect(ctx.triageAct('q_nosec', 'move', { project: 'Waiting' }).item.kind).toBe('waiting');
+  });
+});
+
+describe('accept is safe to retry when saving fails after the Todoist side effect', () => {
+  const failQueueUpdateOnce = ctx => {
+    const real = ctx.Store.queueUpdate;
+    let n = 0;
+    ctx.Store.queueUpdate = function (id, patch) {
+      if (n++ === 0) throw new Error('Service Spreadsheets timed out');
+      return real.call(ctx.Store, id, patch);
+    };
+  };
+  const live = todo => todo.tasks.filter(t => !t.deleted);
+
+  test('new task: deleted again, item pending, retry creates exactly one task', () => {
+    const { ctx, todo } = setup();
+    const before = live(todo).length;
+    failQueueUpdateOnce(ctx);
+    expect(() => ctx.triageAct('q_meet1', 'accept')).toThrow(/Could not save the triage state \(Service Spreadsheets timed out\).*removed again, so it is safe to retry/);
+    expect(todo.deleted.length).toBe(1);
+    expect(live(todo).length).toBe(before);
+    expect(ctx.Store.queueGet('q_meet1').status).toBe('pending');
+    const res = ctx.triageAct('q_meet1', 'accept');
+    expect(res.item.status).toBe('accepted');
+    expect(live(todo).length).toBe(before + 1);
+    expect(live(todo).filter(t => machine(t.description || '') && machine(t.description).q === 'q_meet1').length).toBe(1);
+  });
+
+  test('duplicate comment: deleted again, retry leaves one comment', () => {
+    const { ctx, todo } = setup();
+    failQueueUpdateOnce(ctx);
+    expect(() => ctx.triageAct('q_mail1', 'accept')).toThrow(/comment it created was removed again/);
+    ctx.triageAct('q_mail1', 'accept');
+    expect(todo.comments.filter(c => !c.deleted).length).toBe(1);
+  });
+
+  test('waiting accept and wait are compensated too', () => {
+    const { ctx, todo } = setup();
+    failQueueUpdateOnce(ctx);
+    expect(() => ctx.triageAct('q_wait1', 'accept')).toThrow(/safe to retry/);
+    failQueueUpdateOnce(ctx);
+    expect(() => ctx.triageAct('q_meet1', 'wait', { waitOn: 'Miro' })).toThrow(/safe to retry/);
+    expect(live(todo).filter(t => t.project_id === 'p_wait').length).toBe(0);
+    expect(feedback(ctx, 'rerouted').length).toBe(0);
+  });
+
+  test('when the compensating delete fails too, the error says to check Todoist', () => {
+    const { ctx } = setup();
+    failQueueUpdateOnce(ctx);
+    ctx.__mocks.UrlFetchApp.__on('DELETE', /\/tasks\//, { status: 403, body: 'forbidden' });
+    expect(() => ctx.triageAct('q_meet1', 'accept')).toThrow(/could not be removed: check Todoist before retrying/);
+  });
+
+  test('edit feedback in an accept is written only after the state is saved', () => {
+    const { ctx } = setup();
+    failQueueUpdateOnce(ctx);
+    expect(() => ctx.triageAct('q_meet1', 'accept', { title: 'Reissue C3 credentials' })).toThrow();
+    expect(feedback(ctx, 'edited').length).toBe(0);
+  });
+
+  test('a feedback write failure does not fail or roll back the action', () => {
+    const { ctx } = setup();
+    ctx.Store.feedbackAdd = () => { throw new Error('sheet busy'); };
+    const res = ctx.triageAct('q_meet1', 'dismiss');
+    expect(res.item.status).toBe('dismissed');
+    expect(res.message).toMatch(/feedback not recorded/);
+    expect(ctx.Store.queueGet('q_meet1').status).toBe('dismissed');
+  });
+});
+
+describe('TriageUI.html call queue', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'TriageUI.html'), 'utf8');
+  const block = (html.match(/\/\/ -+ call queue \(begin\)([\s\S]*?)\/\/ -+ call queue \(end\)/) || [])[1];
+  const load = () => {
+    const pending = [];
+    const call = (fn, args, ok, fail) => pending.push({ fn, args, ok, fail });
+    const api = new Function('call', block + '; return {queuedCall: queuedCall, state: function(){return {inflight: inflight, queued: callQueue.length}}, MAX: MAX_INFLIGHT};')(call);
+    return Object.assign(api, { pending });
+  };
+
+  test('never more than MAX_INFLIGHT calls in flight; each completion starts the next', () => {
+    const q = load();
+    const results = [];
+    for (let n = 0; n < 40; n++) q.queuedCall('triageAct', ['q' + n, 'accept', null], r => results.push(r), e => results.push('E' + e.message));
+    expect(q.MAX).toBeLessThanOrEqual(5);
+    expect(q.pending.length).toBe(q.MAX);
+    expect(q.state()).toEqual({ inflight: q.MAX, queued: 40 - q.MAX });
+    let done = 0;
+    while (done < q.pending.length) {
+      const c = q.pending[done++];
+      if (done % 7 === 0) c.fail(new Error('x')); else c.ok(c.args[0]);
+      expect(q.state().inflight).toBeLessThanOrEqual(q.MAX);
+    }
+    expect(q.pending.length).toBe(40);
+    expect(results.length).toBe(40);
+    expect(q.pending.map(c => c.args[0])).toEqual(Array.from({ length: 40 }, (_, n) => 'q' + n));
+    expect(q.state()).toEqual({ inflight: 0, queued: 0 });
+  });
+
+  test('a synchronous failure (not connected) still drains the queue', () => {
+    const fails = [];
+    const api = new Function('call', block + '; return queuedCall;')((fn, args, ok, fail) => fail(new Error('Not connected')));
+    for (let n = 0; n < 12; n++) api('triageAct', [n], () => {}, e => fails.push(e.message));
+    expect(fails.length).toBe(12);
+  });
+
+  test('bulk actions and undo use the queue, and no-ops are left out of the undo entry', () => {
+    const script = (html.match(/<script>([\s\S]*)<\/script>/) || [])[1] || '';
+    expect(script).toContain('queuedCall("triageAct",[i.id,action,patches[n]]');
+    expect(script).toContain('queuedCall("triageAct",[i.id,"undo",null]');
+    expect(script).not.toMatch(/\bcall\("triageAct"/);
+    expect(script).toMatch(/res\.changed===false\)noops\.push/);
+  });
+});
+
 // ------------------------------------------------------------------ TriageUI.html (static contract)
 
 describe('TriageUI.html', () => {
@@ -607,7 +870,7 @@ describe('TriageUI.html', () => {
     expect(() => new Function(script)).not.toThrow();
     expect(script).toContain('google.script.run');
     expect(script).toMatch(/call\("triageList"/);
-    expect(script).toMatch(/call\("triageAct"/);
+    expect(script).toMatch(/[cC]all\("triageAct"/);
     expect(script).toContain('withFailureHandler');
   });
 

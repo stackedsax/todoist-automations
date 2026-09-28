@@ -35,16 +35,50 @@ const Util = {
    * Run fn under the script lock (tryLock 5000ms). If not acquired, log and return null.
    * Otherwise returns fn()'s result; the lock is always released.
    */
+  /** Daily jobs that must not silently wait a whole day when a frequent job holds the lock. */
+  RETRY_ON_BUSY_: { runInboxSweep: 1, runWaiting: 1, runSummaryCheck: 1, runTriageDigest: 1 },
+  RETRY_DELAY_MS: 10 * 60 * 1000,
+
   withLock(name, fn) {
     const lock = LockService.getScriptLock();
     if (!lock.tryLock(5000)) {
       console.log('[' + name + '] another run holds the lock; skipping');
+      if (Util.RETRY_ON_BUSY_[name]) Util.scheduleRetry_(name);
       return null;
     }
     try {
+      if (Util.RETRY_ON_BUSY_[name]) Util.clearRetry_(name);
       return fn();
     } finally {
       lock.releaseLock();
+    }
+  },
+
+  /** One pending one-off retry per handler; its id is remembered so it can be removed later. */
+  scheduleRetry_(name) {
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const key = 'RETRY_TRIGGER_' + name;
+      const existing = props.getProperty(key);
+      if (existing && ScriptApp.getProjectTriggers().some(function (t) { return t.getUniqueId() === existing; })) return;
+      const t = ScriptApp.newTrigger(name).timeBased().after(Util.RETRY_DELAY_MS).create();
+      props.setProperty(key, t.getUniqueId());
+      console.log('[' + name + '] retry scheduled in ' + Math.round(Util.RETRY_DELAY_MS / 60000) + ' min');
+    } catch (e) {
+      console.log('[' + name + '] could not schedule retry: ' + e.message);
+    }
+  },
+
+  clearRetry_(name) {
+    try {
+      const props = PropertiesService.getScriptProperties();
+      const key = 'RETRY_TRIGGER_' + name;
+      const id = props.getProperty(key);
+      if (!id) return;
+      ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getUniqueId() === id) ScriptApp.deleteTrigger(t); });
+      props.deleteProperty(key);
+    } catch (e) {
+      console.log('[' + name + '] could not clear retry: ' + e.message);
     }
   },
 

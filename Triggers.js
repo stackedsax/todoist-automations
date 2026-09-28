@@ -25,7 +25,8 @@ const TRIGGER_SPECS_ = [
 ];
 
 /** Handlers from older versions that installTriggers removes. */
-const LEGACY_TRIGGER_HANDLERS_ = ['processFirefliesEmails'];
+// Legacy handlers plus one-off continuation triggers (backfill) that installTriggers should clear.
+const LEGACY_TRIGGER_HANDLERS_ = ['processFirefliesEmails', 'runBackfill'];
 
 const REQUIRED_PROPS_ = ['TODOIST_API_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_MODEL', 'GRANOLA_API_KEY'];
 
