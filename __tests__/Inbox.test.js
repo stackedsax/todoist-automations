@@ -299,6 +299,15 @@ describe('runInboxSweep', () => {
     expect(fb.map(f => f.title)).toEqual(['Reply to the CNCF newsletter']);
   });
 
+  test('uses Extract.dismissalFeedback when available so undone dismissals are withdrawn', () => {
+    const { ctx } = setup();
+    const rows = [{ type: 'undone', queueId: 'q1', detail: { action: 'dismiss' } }, { type: 'dismissed', queueId: 'q1', title: 'x' }];
+    ctx.Extract.dismissalFeedback = jest.fn(() => rows);
+    ctx.runInboxSweep();
+    expect(ctx.Extract.dismissalFeedback).toHaveBeenCalledWith(20);
+    expect(ctx.Extract.email.mock.calls[0][1].feedback).toBe(rows);
+  });
+
   test('ledger prevents reprocessing; a new message makes the thread eligible again without re-queueing the same item', () => {
     const { ctx, gmail } = setup();
     ctx.runInboxSweep();

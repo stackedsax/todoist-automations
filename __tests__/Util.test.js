@@ -50,6 +50,99 @@ describe('Util', () => {
       expect(fn).not.toHaveBeenCalled();
       expect(ctx.__mocks.logs.join('\n')).toMatch(/runMeetings.*lock/);
     });
+
+    describe('daily-job retry when the lock is busy', () => {
+      const retryTriggers = (ctx, name) => ctx.__mocks.ScriptApp.__triggers.filter(t => t.getHandlerFunction() === name);
+      const prop = (ctx, name) => ctx.__mocks.PropertiesService.__script.__store['RETRY_TRIGGER_' + name];
+
+      test('a daily job schedules one 10-minute one-off retry and stores its id', () => {
+        const ctx = load();
+        ctx.__mocks.LockService.__available = false;
+        expect(ctx.Util.withLock('runInboxSweep', jest.fn())).toBeNull();
+        const ts = retryTriggers(ctx, 'runInboxSweep');
+        expect(ts).toHaveLength(1);
+        expect(ts[0].__config.after).toBe(10 * 60 * 1000);
+        expect(prop(ctx, 'runInboxSweep')).toBe(ts[0].getUniqueId());
+        expect(ctx.__mocks.logs.join('\n')).toMatch(/runInboxSweep.*retry scheduled in 10 min/);
+      });
+
+      test('repeated busy runs keep exactly one pending retry per handler', () => {
+        const ctx = load();
+        ctx.__mocks.LockService.__available = false;
+        ctx.Util.withLock('runWaiting', jest.fn());
+        ctx.Util.withLock('runWaiting', jest.fn());
+        ctx.Util.withLock('runWaiting', jest.fn());
+        ctx.Util.withLock('runTriageDigest', jest.fn());
+        const ts = retryTriggers(ctx, 'runWaiting');
+        expect(ts).toHaveLength(1);
+        expect(prop(ctx, 'runWaiting')).toBe(ts[0].getUniqueId());
+        expect(retryTriggers(ctx, 'runTriageDigest')).toHaveLength(1);
+      });
+
+      test('a retry that fires into a busy lock reschedules even though its own trigger is still listed', () => {
+        const ctx = load();
+        ctx.__mocks.LockService.__available = false;
+        ctx.Util.withLock('runSummaryCheck', jest.fn());
+        const first = prop(ctx, 'runSummaryCheck');
+        // The first retry fires (Apps Script may still list a fired one-off trigger) and is busy again.
+        ctx.Util.withLock('runSummaryCheck', jest.fn());
+        const ts = retryTriggers(ctx, 'runSummaryCheck');
+        expect(ts).toHaveLength(1);
+        expect(ts[0].getUniqueId()).not.toBe(first);
+        expect(prop(ctx, 'runSummaryCheck')).toBe(ts[0].getUniqueId());
+      });
+
+      test('the next successful acquire deletes the pending retry and its property, leaving other triggers', () => {
+        const ctx = load();
+        const SA = ctx.__mocks.ScriptApp;
+        const daily = SA.newTrigger('runInboxSweep').timeBased().everyDays(1).atHour(7).create();
+        ctx.__mocks.LockService.__available = false;
+        ctx.Util.withLock('runInboxSweep', jest.fn());
+        expect(retryTriggers(ctx, 'runInboxSweep')).toHaveLength(2);
+        ctx.__mocks.LockService.__available = true;
+        const fn = jest.fn(() => 'ran');
+        expect(ctx.Util.withLock('runInboxSweep', fn)).toBe('ran');
+        expect(fn).toHaveBeenCalledTimes(1);
+        expect(retryTriggers(ctx, 'runInboxSweep')).toEqual([daily]);
+        expect(prop(ctx, 'runInboxSweep')).toBeUndefined();
+      });
+
+      test('a successful acquire with no pending retry touches no triggers', () => {
+        const ctx = load();
+        ctx.Util.withLock('runWaiting', () => 1);
+        expect(ctx.__mocks.ScriptApp.deleteTrigger).not.toHaveBeenCalled();
+        expect(ctx.__mocks.ScriptApp.newTrigger).not.toHaveBeenCalled();
+      });
+
+      test('frequent jobs never schedule or clear retries', () => {
+        const ctx = load();
+        ctx.__mocks.LockService.__available = false;
+        ['runMeetings', 'runSlack', 'createTaskFromStarred', 'runBackfill'].forEach(n => ctx.Util.withLock(n, jest.fn()));
+        expect(ctx.__mocks.ScriptApp.newTrigger).not.toHaveBeenCalled();
+        expect(Object.keys(ctx.__mocks.PropertiesService.__script.__store).filter(k => /^RETRY_TRIGGER_/.test(k))).toEqual([]);
+        ctx.__mocks.LockService.__available = true;
+        ctx.__mocks.PropertiesService.__script.__store.RETRY_TRIGGER_runMeetings = 'x';
+        ctx.Util.withLock('runMeetings', () => 1);
+        expect(ctx.__mocks.PropertiesService.__script.__store.RETRY_TRIGGER_runMeetings).toBe('x');
+      });
+
+      test('a ScriptApp failure while scheduling is logged and does not throw', () => {
+        const ctx = load();
+        ctx.__mocks.LockService.__available = false;
+        ctx.__mocks.ScriptApp.newTrigger.mockImplementation(() => { throw new Error('quota'); });
+        expect(ctx.Util.withLock('runInboxSweep', jest.fn())).toBeNull();
+        expect(ctx.__mocks.logs.join('\n')).toMatch(/could not schedule retry: quota/);
+        expect(prop(ctx, 'runInboxSweep')).toBeUndefined();
+      });
+
+      test('a ScriptApp failure while clearing is logged and the job still runs', () => {
+        const ctx = load();
+        ctx.__mocks.PropertiesService.__script.__store.RETRY_TRIGGER_runWaiting = 'trigger_9';
+        ctx.__mocks.ScriptApp.getProjectTriggers.mockImplementation(() => { throw new Error('boom'); });
+        expect(ctx.Util.withLock('runWaiting', () => 'ok')).toBe('ok');
+        expect(ctx.__mocks.logs.join('\n')).toMatch(/could not clear retry: boom/);
+      });
+    });
   });
 
   test('hash is stable hex, default 16 chars, configurable length', () => {

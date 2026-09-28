@@ -730,7 +730,11 @@ const Slack = {
 
   dismissals_(ctx) {
     if (!ctx.cache.dismissals) {
-      try { ctx.cache.dismissals = Store.feedbackRecent(20, 'dismissed'); } catch (e) { ctx.cache.dismissals = []; }
+      try {
+        // Includes 'undone' rows so an undone dismissal stops being a negative example.
+        ctx.cache.dismissals = typeof Extract.dismissalFeedback === 'function'
+          ? Extract.dismissalFeedback(20) : Store.feedbackRecent(20, 'dismissed');
+      } catch (e) { ctx.cache.dismissals = []; }
     }
     return ctx.cache.dismissals;
   },

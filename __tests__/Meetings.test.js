@@ -325,6 +325,16 @@ describe('runMeetings — decisions', () => {
     expect(exOpts.today).toBe('2026-09-25');
   });
 
+  test('negative examples come from Extract.dismissalFeedback when available (undone dismissals included)', () => {
+    const ctx = setup();
+    const rows = [{ type: 'undone', queueId: 'q1', detail: { action: 'dismiss' } }, { type: 'dismissed', queueId: 'q1', title: 'Order pizza' }];
+    ctx.fakes.Extract.dismissalFeedback = jest.fn(() => rows);
+    ctx.runMeetings();
+    expect(ctx.fakes.Extract.dismissalFeedback).toHaveBeenCalledTimes(1);
+    expect(ctx.fakes.Extract.dismissalFeedback).toHaveBeenCalledWith(20);
+    expect(ctx.fakes.Extract.meeting.mock.calls[0][1].feedback).toBe(rows);
+  });
+
   test('a duplicate of a task created earlier in the same run is queued with dupTaskId', () => {
     const ctx = setup();
     ctx.state.items['granola:not_new0924'] = [item({ project: 'GR' })]; // same title as the sync item

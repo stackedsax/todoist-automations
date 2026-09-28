@@ -65,8 +65,17 @@ function installTriggers() {
   TRIGGER_SPECS_.forEach(function (s) { managed[s.handler] = true; });
   LEGACY_TRIGGER_HANDLERS_.forEach(function (h) { managed[h] = true; });
 
+  // A backfill still in progress keeps its one-off continuation (Meetings.scheduleContinuation_),
+  // so running installTriggers right after runBackfill does not stop it half way.
+  const keepBackfill = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'runBackfill'; }) &&
+    backfillInProgress_();
   let removed = 0;
+  let keptBackfill = 0;
   ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (keepBackfill && t.getHandlerFunction() === 'runBackfill') {
+      keptBackfill++;
+      return;
+    }
     if (managed[t.getHandlerFunction()]) {
       ScriptApp.deleteTrigger(t);
       removed++;
@@ -92,8 +101,24 @@ function installTriggers() {
 
   console.log('[installTriggers] removed ' + removed + ' old trigger(s); installed: ' +
     installed.map(function (i) { return i.handler + ' (' + i.schedule + ')'; }).join(', ') +
-    (skipped.length ? '; skipped: ' + skipped.map(function (s) { return s.handler + ' (' + s.reason + ')'; }).join(', ') : ''));
-  return { installed: installed, removed: removed, skipped: skipped };
+    (skipped.length ? '; skipped: ' + skipped.map(function (s) { return s.handler + ' (' + s.reason + ')'; }).join(', ') : '') +
+    (keptBackfill ? '; kept the pending runBackfill continuation (backfill still in progress)' : ''));
+  return { installed: installed, removed: removed, skipped: skipped, keptBackfill: keptBackfill };
+}
+
+/**
+ * True when the kv backfill cursor describes a window that has not finished. Never throws, and
+ * never creates the state spreadsheet (no STATE_SHEET_ID means no backfill has run).
+ */
+function backfillInProgress_() {
+  try {
+    if (!Config.get('STATE_SHEET_ID', null)) return false;
+    const cur = Store.kvGet(Meetings.KV_BACKFILL, null);
+    return !!(cur && cur.from && !cur.complete);
+  } catch (e) {
+    console.log('[installTriggers] could not read the backfill cursor: ' + (e && e.message));
+    return false;
+  }
 }
 
 /** Delete every trigger of this script project. @return {number} how many were removed */
@@ -329,10 +354,18 @@ function setupCheckTriggers_(r) {
   const handlers = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
   r.triggers = handlers;
   LEGACY_TRIGGER_HANDLERS_.forEach(function (h) {
-    if (handlers.indexOf(h) >= 0) r.warnings.push('Legacy trigger ' + h + ' is still installed: run installTriggers to remove it.');
+    if (handlers.indexOf(h) < 0) return;
+    if (h === 'runBackfill') r.info.push('Backfill in progress (continuation scheduled).');
+    else r.warnings.push('Legacy trigger ' + h + ' is still installed: run installTriggers to remove it.');
   });
+  // One-off lock-busy retries (Util.scheduleRetry_) are not the recurring schedule.
+  const props = PropertiesService.getScriptProperties();
+  const scheduled = ScriptApp.getProjectTriggers().filter(function (t) {
+    const retryId = props.getProperty('RETRY_TRIGGER_' + t.getHandlerFunction());
+    return !(retryId && retryId === t.getUniqueId());
+  }).map(function (t) { return t.getHandlerFunction(); });
   const missing = TRIGGER_SPECS_.filter(function (s) {
-    return handlers.indexOf(s.handler) < 0 && !triggerSkipReason_(s);
+    return scheduled.indexOf(s.handler) < 0 && !triggerSkipReason_(s);
   }).map(function (s) { return s.handler; });
   if (!handlers.length) r.warnings.push('No triggers installed yet: run runBackfill (optional), then installTriggers.');
   else if (missing.length) r.warnings.push('Triggers not installed for ' + missing.join(', ') + ': run installTriggers.');

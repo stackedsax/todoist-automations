@@ -156,12 +156,78 @@ describe('Extract.meeting prompt', () => {
       { type: 'dismissed', title: 'Send a thank-you note', sourceKey: 'gmail:abc:def', detail: null }
     ]);
     ctx.Extract.meeting(granolaMeeting(), { sectionsByProject: CATALOGUE });
-    expect(ctx.Store.feedbackRecent).toHaveBeenCalledWith(20, 'dismissed');
+    expect(ctx.Store.feedbackRecent).toHaveBeenCalledWith(100);
     const sys = ctx.Claude.json.mock.calls[0][0].system;
     expect(sys).toMatch(/PREVIOUSLY DISMISSED/);
     expect(sys).toMatch(/- "Review the team OKRs" \[granola\] \(reason: group item\)/);
     expect(sys).toMatch(/- "Send a thank-you note" \[gmail\]/);
     expect(sys).not.toMatch(/Should not appear/);
+  });
+
+  describe('undone dismissals are not negative examples', () => {
+    const sysFor = (ctx, rows) => {
+      ctx.Extract.meeting(granolaMeeting(), { sectionsByProject: CATALOGUE, feedback: rows });
+      return ctx.Claude.json.mock.calls[ctx.Claude.json.mock.calls.length - 1][0].system;
+    };
+    const T1 = '2026-09-20T10:00:00.000Z', T2 = '2026-09-21T10:00:00.000Z', T3 = '2026-09-22T10:00:00.000Z';
+
+    test('an undo matched by detail.at withdraws that dismissal only', () => {
+      const ctx = setup();
+      const sys = sysFor(ctx, [
+        { at: T3, type: 'undone', queueId: 'q1', title: 'Book the offsite venue', detail: { action: 'dismiss', at: T1 } },
+        { at: T2, type: 'dismissed', queueId: 'q2', title: 'Order new laptops', detail: {} },
+        { at: T1, type: 'dismissed', queueId: 'q1', title: 'Book the offsite venue', detail: {} }
+      ]);
+      expect(sys).not.toMatch(/Book the offsite venue/);
+      expect(sys).toMatch(/- "Order new laptops"/);
+    });
+
+    test('dismiss, undo, dismiss again: the re-dismissal stands', () => {
+      const ctx = setup();
+      const sys = sysFor(ctx, [
+        { at: T3, type: 'dismissed', queueId: 'q1', title: 'Book the offsite venue', detail: {} },
+        { at: T2, type: 'undone', queueId: 'q1', title: 'Book the offsite venue', detail: JSON.stringify({ action: 'dismiss', at: T1 }) },
+        { at: T1, type: 'dismissed', queueId: 'q1', title: 'Book the offsite venue', detail: {} }
+      ]);
+      expect(sys.match(/Book the offsite venue/g)).toHaveLength(1);
+    });
+
+    test('an undo without detail.at withdraws the newest earlier dismissal of that item', () => {
+      const ctx = setup();
+      const sys = sysFor(ctx, [
+        { at: T3, type: 'dismissed', queueId: 'q1', title: 'Later dismissal', detail: {} },
+        { at: T2, type: 'undone', queueId: 'q1', title: 'x', detail: { action: 'dismiss' } },
+        { at: T1, type: 'dismissed', queueId: 'q1', title: 'Earlier dismissal', detail: {} }
+      ]);
+      expect(sys).toMatch(/Later dismissal/);
+      expect(sys).not.toMatch(/Earlier dismissal/);
+    });
+
+    test('undos of other actions or other items change nothing', () => {
+      const ctx = setup();
+      const sys = sysFor(ctx, [
+        { at: T3, type: 'undone', queueId: 'q1', title: 'Book the offsite venue', detail: { action: 'edit', at: T1 } },
+        { at: T3, type: 'undone', queueId: 'q9', title: 'Book the offsite venue', detail: { action: 'dismiss', at: T1 } },
+        { at: T1, type: 'dismissed', queueId: 'q1', title: 'Book the offsite venue', detail: {} }
+      ]);
+      expect(sys).toMatch(/- "Book the offsite venue"/);
+    });
+
+    test('the default Store read includes undone rows and applies them', () => {
+      const ctx = setup();
+      ctx.Store.feedbackRecent.mockReturnValue([
+        { at: T2, type: 'undone', queueId: 'q1', title: 'Book the offsite venue', detail: { action: 'dismiss', at: T1 } },
+        { at: T2, type: 'rerouted', queueId: 'q3', title: 'Rerouted thing', detail: {} },
+        { at: T1, type: 'dismissed', queueId: 'q1', title: 'Book the offsite venue', detail: {} },
+        { at: T1, type: 'dismissed', queueId: 'q2', title: 'Order new laptops', detail: {} }
+      ]);
+      ctx.Extract.meeting(granolaMeeting(), { sectionsByProject: CATALOGUE });
+      const sys = ctx.Claude.json.mock.calls[0][0].system;
+      expect(sys).not.toMatch(/Book the offsite venue/);
+      expect(sys).not.toMatch(/Rerouted thing/);
+      expect(sys).toMatch(/- "Order new laptops"/);
+      expect(ctx.Extract.dismissalFeedback().map(f => f.type)).toEqual(['undone', 'dismissed', 'dismissed']);
+    });
   });
 
   test('dismissals capped at 20; Store failure does not break extraction', () => {

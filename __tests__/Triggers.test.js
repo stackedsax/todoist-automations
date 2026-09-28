@@ -105,6 +105,38 @@ describe('installTriggers', () => {
     expect(hs.filter(h => h === 'createTaskFromStarred')).toHaveLength(1);
   });
 
+  test('keeps a pending runBackfill continuation while the backfill cursor is incomplete', () => {
+    const ctx = load();
+    const SA = ctx.__mocks.ScriptApp;
+    ctx.Store.kvSet('backfill.cursor', { from: '2026-08-28T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z', runs: 1, complete: false });
+    expect(ctx.__mocks.props.STATE_SHEET_ID).toBeTruthy();
+    const cont = SA.newTrigger('runBackfill').timeBased().after(60000).create();
+    const res = ctx.installTriggers();
+    expect(res.keptBackfill).toBe(1);
+    expect(SA.__triggers).toContain(cont);
+    expect(handlers(ctx).filter(h => h === 'runBackfill')).toHaveLength(1);
+    expect(ctx.__mocks.logs.join('\n')).toMatch(/kept the pending runBackfill continuation/);
+  });
+
+  test('removes a leftover runBackfill trigger once the backfill is complete', () => {
+    const ctx = load();
+    const SA = ctx.__mocks.ScriptApp;
+    ctx.Store.kvSet('backfill.cursor', { from: '2026-08-28T00:00:00.000Z', to: '2026-09-25T00:00:00.000Z', runs: 3, complete: true });
+    SA.newTrigger('runBackfill').timeBased().after(60000).create();
+    const res = ctx.installTriggers();
+    expect(res.keptBackfill).toBe(0);
+    expect(handlers(ctx)).not.toContain('runBackfill');
+  });
+
+  test('without a state sheet a runBackfill trigger is removed and no spreadsheet is created', () => {
+    const ctx = load();
+    const SA = ctx.__mocks.ScriptApp;
+    SA.newTrigger('runBackfill').timeBased().after(60000).create();
+    ctx.installTriggers();
+    expect(handlers(ctx)).not.toContain('runBackfill');
+    expect(ctx.__mocks.props.STATE_SHEET_ID).toBeUndefined();
+  });
+
   test('skips runSlack when no Slack workspaces are configured', () => {
     const props = Object.assign({}, ALL_PROPS);
     delete props.SLACK_WORKSPACES;
@@ -314,6 +346,41 @@ describe('checkSetup', () => {
     expect(warns).toMatch(/Legacy trigger processFirefliesEmails is still installed/);
     expect(warns).toMatch(/Triggers not installed for createTaskFromStarred, runSlack/);
     expect(r.triggers).toEqual(['processFirefliesEmails', 'runMeetings']);
+  });
+
+  test('a pending runBackfill continuation is info, not a legacy warning; processFirefliesEmails still warns', () => {
+    const ctx = load();
+    wire(ctx);
+    const SA = ctx.__mocks.ScriptApp;
+    SA.newTrigger('runBackfill').timeBased().after(60000).create();
+    SA.newTrigger('processFirefliesEmails').timeBased().everyMinutes(5).create();
+    const r = ctx.checkSetup();
+    expect(r.info).toContain('Backfill in progress (continuation scheduled).');
+    expect(r.warnings.join('\n')).not.toMatch(/runBackfill/);
+    expect(r.warnings.join('\n')).toMatch(/Legacy trigger processFirefliesEmails is still installed/);
+  });
+
+  test('a pending lock-busy retry does not count as the installed daily trigger', () => {
+    const ctx = load();
+    wire(ctx);
+    ctx.installTriggers();
+    const SA = ctx.__mocks.ScriptApp;
+    SA.__triggers.filter(t => t.getHandlerFunction() === 'runWaiting').forEach(t => SA.deleteTrigger(t));
+    const retry = SA.newTrigger('runWaiting').timeBased().after(600000).create();
+    ctx.__mocks.PropertiesService.__script.__store.RETRY_TRIGGER_runWaiting = retry.getUniqueId();
+    const r = ctx.checkSetup();
+    expect(r.warnings.join('\n')).toMatch(/Triggers not installed for runWaiting/);
+  });
+
+  test('a pending lock-busy retry alongside the daily trigger passes the check', () => {
+    const ctx = load();
+    wire(ctx);
+    ctx.installTriggers();
+    const SA = ctx.__mocks.ScriptApp;
+    const retry = SA.newTrigger('runWaiting').timeBased().after(600000).create();
+    ctx.__mocks.PropertiesService.__script.__store.RETRY_TRIGGER_runWaiting = retry.getUniqueId();
+    const r = ctx.checkSetup();
+    expect(r.warnings.join('\n')).not.toMatch(/Trigger/);
   });
 
   test('after installTriggers, the trigger check passes', () => {

@@ -128,7 +128,11 @@ const Inbox = {
     if (work.length) {
       const ctx = {
         catalogue: Inbox.safe_(function () { return Route.sectionCatalogue(); }, {}),
-        dismissals: Inbox.safe_(function () { return Store.feedbackRecent(Extract.MAX_DISMISSALS || 20, 'dismissed'); }, []),
+        dismissals: Inbox.safe_(function () {
+          return typeof Extract.dismissalFeedback === 'function'
+            ? Extract.dismissalFeedback(Extract.MAX_DISMISSALS || 20)
+            : Store.feedbackRecent(Extract.MAX_DISMISSALS || 20, 'dismissed');
+        }, []),
         notDup: Inbox.safe_(function () { return Dedupe.notDuplicateFeedback(200); }, []),
         openTasks: null,
         today: Util.today()

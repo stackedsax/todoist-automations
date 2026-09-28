@@ -31,14 +31,15 @@ const Util = {
     };
   },
 
-  /**
-   * Run fn under the script lock (tryLock 5000ms). If not acquired, log and return null.
-   * Otherwise returns fn()'s result; the lock is always released.
-   */
   /** Daily jobs that must not silently wait a whole day when a frequent job holds the lock. */
   RETRY_ON_BUSY_: { runInboxSweep: 1, runWaiting: 1, runSummaryCheck: 1, runTriageDigest: 1 },
   RETRY_DELAY_MS: 10 * 60 * 1000,
 
+  /**
+   * Run fn under the script lock (tryLock 5000ms). If not acquired, log and return null; for the
+   * daily jobs in RETRY_ON_BUSY_ also schedule a one-off retry in RETRY_DELAY_MS. On a successful
+   * acquire any pending retry for that job is removed. Returns fn()'s result; the lock is always released.
+   */
   withLock(name, fn) {
     const lock = LockService.getScriptLock();
     if (!lock.tryLock(5000)) {
@@ -54,13 +55,20 @@ const Util = {
     }
   },
 
-  /** One pending one-off retry per handler; its id is remembered so it can be removed later. */
+  /**
+   * One pending one-off retry per handler; its id is remembered (Script Property RETRY_TRIGGER_<name>)
+   * so it can be removed later. A previous retry is replaced rather than kept: a one-off trigger that
+   * has already fired can stay listed in getProjectTriggers, so "it still exists" does not mean
+   * "it is still pending", and keeping it would drop the retry when the retry itself finds the lock busy.
+   */
   scheduleRetry_(name) {
     try {
       const props = PropertiesService.getScriptProperties();
       const key = 'RETRY_TRIGGER_' + name;
       const existing = props.getProperty(key);
-      if (existing && ScriptApp.getProjectTriggers().some(function (t) { return t.getUniqueId() === existing; })) return;
+      if (existing) {
+        ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getUniqueId() === existing) ScriptApp.deleteTrigger(t); });
+      }
       const t = ScriptApp.newTrigger(name).timeBased().after(Util.RETRY_DELAY_MS).create();
       props.setProperty(key, t.getUniqueId());
       console.log('[' + name + '] retry scheduled in ' + Math.round(Util.RETRY_DELAY_MS / 60000) + ' min');

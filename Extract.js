@@ -550,17 +550,73 @@ const Extract = {
 
   // ---------------------------------------------------------------- helpers (private)
 
-  dismissals_(feedback) {
-    let rows = feedback;
-    if (rows === undefined) {
-      try {
-        rows = Store.feedbackRecent(Extract.MAX_DISMISSALS, 'dismissed');
-      } catch (e) {
-        console.log('Extract: could not read feedback: ' + e.message);
-        rows = [];
-      }
+  /**
+   * Recent feedback for negative examples: dismissed rows plus the 'undone' rows that withdraw
+   * them, newest first (mixed types; pass it as opts.feedback). Callers that load
+   * feedbackRecent(n, 'dismissed') only cannot see undos, so prefer this.
+   * @param {number} [n=Extract.MAX_DISMISSALS]
+   */
+  dismissalFeedback(n) {
+    const lim = n || Extract.MAX_DISMISSALS;
+    try {
+      return (Store.feedbackRecent(lim * 5) || []).filter(function (f) {
+        return f && (f.type === 'dismissed' || (f.type === 'undone' && Extract.detail_(f).action === 'dismiss'));
+      });
+    } catch (e) {
+      console.log('Extract: could not read feedback: ' + e.message);
+      return [];
     }
-    return (rows || []).filter(function (f) { return f && f.type === 'dismissed' && f.title; }).slice(0, Extract.MAX_DISMISSALS);
+  },
+
+  /**
+   * Dismissed rows that still stand, newest first, capped at MAX_DISMISSALS. A row is dropped when
+   * an 'undone' row with detail.action 'dismiss' for the same queueId withdraws it: matched by
+   * detail.at (the dismissal's own `at`, within UNDO_PAIR_MS_), or, when the undo carries no time,
+   * the newest dismissal of that item written before the undo.
+   */
+  dismissals_(feedback) {
+    const rows = (feedback === undefined ? Extract.dismissalFeedback(Extract.MAX_DISMISSALS) : feedback) || [];
+    const dismissed = [];
+    const undos = [];
+    rows.forEach(function (f, i) {
+      if (!f) return;
+      if (f.type === 'dismissed') dismissed.push({ f: f, i: i, ms: Extract.ms_(f.at) });
+      else if (f.type === 'undone' && f.queueId && Extract.detail_(f).action === 'dismiss') {
+        undos.push({ f: f, i: i, ms: Extract.ms_(f.at), target: Extract.ms_(Extract.detail_(f).at) });
+      }
+    });
+    const withdrawn = {};
+    undos.forEach(function (u) {
+      const mine = dismissed.filter(function (d) { return !withdrawn[d.i] && d.f.queueId === u.f.queueId; });
+      let hit = null;
+      if (!isNaN(u.target)) {
+        hit = mine.filter(function (d) { return !isNaN(d.ms) && Math.abs(d.ms - u.target) <= Extract.UNDO_PAIR_MS_; })[0] || null;
+      } else {
+        // Rows are newest first: the first same-item dismissal older than the undo.
+        hit = mine.filter(function (d) {
+          return !isNaN(u.ms) && !isNaN(d.ms) ? d.ms <= u.ms : d.i > u.i;
+        })[0] || null;
+      }
+      if (hit) withdrawn[hit.i] = 1;
+    });
+    return dismissed.filter(function (d) { return !withdrawn[d.i] && d.f.title; })
+      .map(function (d) { return d.f; })
+      .slice(0, Extract.MAX_DISMISSALS);
+  },
+
+  UNDO_PAIR_MS_: 5000,
+
+  detail_(f) {
+    const d = f && f.detail;
+    if (d && typeof d === 'object') return d;
+    const p = typeof d === 'string' ? Util.parseJson(d, null) : null;
+    return p && typeof p === 'object' ? p : {};
+  },
+
+  ms_(v) {
+    if (v instanceof Date) return v.getTime();
+    const d = v ? Util.parseDate(v) : null;
+    return d ? d.getTime() : NaN;
   },
 
   projectGuide_() {

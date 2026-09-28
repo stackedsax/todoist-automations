@@ -447,6 +447,18 @@ describe('mentions / DMs -> triage queue', () => {
     })];
   }
 
+  test('negative examples come from Extract.dismissalFeedback (so undone dismissals are withdrawn)', () => {
+    const ctx = setup();
+    withMentions(ctx);
+    const rows = [{ type: 'undone', queueId: 'q1', detail: { action: 'dismiss' } }, { type: 'dismissed', queueId: 'q1', title: 'x' }];
+    ctx.fakes.Extract.dismissalFeedback = jest.fn(() => rows);
+    ctx.Slack.run();
+    expect(ctx.fakes.Extract.dismissalFeedback).toHaveBeenCalledWith(20);
+    const withFb = ctx.state.extractCalls.filter(c => c.opts.feedback !== undefined);
+    expect(withFb.length).toBeGreaterThan(0);
+    withFb.forEach(c => expect(c.opts.feedback).toBe(rows));
+  });
+
   test('queues extracted items with origin, link, routing and a machine-lined description', () => {
     const ctx = setup();
     withMentions(ctx);

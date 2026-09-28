@@ -145,13 +145,14 @@ Fix every **Errors** line and run it again. **Warnings** don't block anything.
 
 ### 6. Run `runBackfill`
 
-`runBackfill` goes through meeting notes from the last `BACKFILL_DAYS` (default 28). Everything it finds goes to the **triage queue**, marked with a `Backfill` chip, and nothing becomes a task directly. One execution has about 4.5 minutes, so it saves its place (kv `backfill.cursor`) and stops. **Run it again until the `runs` tab stops showing `backfill incomplete`.** Triage the results in the web app. The ledger stops the scheduled runs from processing those meetings again.
+`runBackfill` goes through meeting notes from the last `BACKFILL_DAYS` (default 28). Everything it finds goes to the **triage queue**, marked with a `Backfill` chip, and nothing becomes a task directly. One execution has about 4.5 minutes, so it saves its place (kv `backfill.cursor`), schedules a one-off `runBackfill` trigger for one minute later, and stops. **You only run it once:** it keeps continuing by itself until the window is done (`checkSetup` shows `Backfill in progress` while a continuation is pending, and the `runs` tab stops showing `backfill incomplete` when it finishes). If a continuation could not be scheduled, the execution log says so; then run `runBackfill` again by hand. Triage the results in the web app. The ledger stops the scheduled runs from processing those meetings again.
 
 ### 7. Run `installTriggers`
 
 Select **`installTriggers`** › **Run**. You can run it as often as you like. Each time it:
 
 - deletes this project's managed triggers, including the legacy `processFirefliesEmails` and any old `createTaskFromStarred` trigger;
+- keeps a pending `runBackfill` continuation while the backfill is still in progress, so you can run it straight after step 6 (a leftover `runBackfill` trigger from a finished backfill is removed);
 - creates the schedule shown above;
 - leaves triggers it doesn't manage alone.
 

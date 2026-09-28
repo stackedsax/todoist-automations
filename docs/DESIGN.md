@@ -15,7 +15,7 @@ This is the contract every module is built against. If code and this doc disagre
 - All `.js` files at repo root share ONE global scope. No `require`, no `import`, no `module.exports` in production files. Private helpers end with `_` (Apps Script convention; also hides them from the script runner menu).
 - Namespacing: each module exposes one global object, e.g. `const Granola = { ... }` — EXCEPT trigger entrypoints, which must be top-level `function` declarations (listed below).
 - Max 6 min per execution. Every long job uses `Util.deadline(ms)` and stops cleanly (saving its cursor) at ~4.5 min.
-- Overlapping runs: wrap each entrypoint in `Util.withLock(name, fn)` (LockService script lock, `tryLock(5000)`; if lock not acquired, log and return).
+- Overlapping runs: wrap each entrypoint in `Util.withLock(name, fn)` (LockService script lock, `tryLock(5000)`; if lock not acquired, log and return). The daily jobs (`runInboxSweep`, `runWaiting`, `runSummaryCheck`, `runTriageDigest`) additionally schedule one one-off retry 10 minutes later (id in Script Property `RETRY_TRIGGER_<name>`; a previous retry trigger is deleted and replaced, since a fired one-off trigger can still be listed), and a successful acquire removes any pending retry.
 - HTTP only via `Http.fetchJson(url, opts)` (UrlFetchApp with `muteHttpExceptions: true`, retries with backoff on 429/5xx, honours `Retry-After`, max 3 attempts, throws `HttpError`-shaped `Error` with `.status` and `.body`).
 - No `console.log` of secrets or full email bodies.
 - `Date.now()` is fine in Apps Script; for testability, modules get "now" from `Util.now()` (returns `new Date()`; tests can stub it).
@@ -62,7 +62,7 @@ Tests live in `__tests__/`. Shared harness: `__tests__/helpers/gas.js` exports `
 | `runTriageDigest` | daily ~08:15 |
 | `runBackfill` | manual only: `runBackfill()` processes the last `BACKFILL_DAYS` (default 28) days, sending EVERYTHING to the triage queue (never direct), resumable across executions via kv cursor |
 
-`installTriggers` is idempotent: deletes existing triggers for these handler names (and the legacy `processFirefliesEmails`) before creating. Manifest timezone: `America/Los_Angeles`.
+`installTriggers` is idempotent: deletes existing triggers for these handler names (and the legacy `processFirefliesEmails`, plus any `runBackfill` continuation) before creating. Exception: a pending `runBackfill` continuation is kept while the kv `backfill.cursor` is incomplete, so a backfill in progress is not stopped. `runBackfill` itself schedules a one-off 1-minute `runBackfill` continuation when work remains. Manifest timezone: `America/Los_Angeles`.
 
 ## Script Properties (Config)
 
