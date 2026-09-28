@@ -737,7 +737,10 @@ const Slack = {
 
   notDuplicates_(ctx) {
     if (!ctx.cache.notDup) {
-      ctx.cache.notDup = Dedupe.notDuplicateFeedback(200);
+      try {
+        ctx.cache.notDup = typeof Dedupe.notDuplicateFeedback === 'function'
+          ? Dedupe.notDuplicateFeedback(200) : Store.feedbackRecent(200, 'not_duplicate');
+      } catch (e) { ctx.cache.notDup = []; }
     }
     return ctx.cache.notDup;
   },
