@@ -1,4 +1,11 @@
-**
-!Code.js
-!Fireflies.js
+**/**
+!*.js
+!TriageUI.html
 !appsscript.json
+eslint.config.js
+jest.config.js
+docs/**
+__tests__/**
+node_modules/**
+coverage/**
+.github/**
