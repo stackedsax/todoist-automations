@@ -21,6 +21,7 @@ module.exports = {
       statements: 0
     }
   },
+  testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/'],
   testMatch: [
     '**/__tests__/**/*.js',
     '**/?(*.)+(spec|test).js'

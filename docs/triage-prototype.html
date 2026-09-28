@@ -1,0 +1,412 @@
+<title>Todo Triage</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F3F4F6; --panel:#FFFFFF; --ink:#15181E; --ink2:#4A5160; --ink3:#7A8291;
+  --line:#E1E4EA; --hover:#EEF1F5; --cursor:#E6ECF7; --accent:#2F5BD3; --accentInk:#FFFFFF;
+  --ok:#1F7A4D; --okBg:#E3F3EA; --warn:#9A5B00; --warnBg:#FBF0DC; --muted:#EDEFF3;
+  --gr:#1E88C9; --isc:#E07B24; --me:#B03A8C; --sg:#5E9E2A;
+  --shadow:0 8px 30px rgba(20,24,32,.14);
+  --sans:"IBM Plex Sans",-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#111318; --panel:#191C22; --ink:#E8EAEE; --ink2:#AEB4BF; --ink3:#7E8593;
+    --line:#2A2E36; --hover:#20242B; --cursor:#1F2A40; --accent:#6F95F2; --accentInk:#0D1220;
+    --ok:#5CC98E; --okBg:#17302A; --warn:#E3AE5B; --warnBg:#352A17; --muted:#23272F;
+    --gr:#4EAAE6; --isc:#F29A4E; --me:#D66BB4; --sg:#8CC35C; --shadow:0 8px 30px rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#111318; --panel:#191C22; --ink:#E8EAEE; --ink2:#AEB4BF; --ink3:#7E8593;
+  --line:#2A2E36; --hover:#20242B; --cursor:#1F2A40; --accent:#6F95F2; --accentInk:#0D1220;
+  --ok:#5CC98E; --okBg:#17302A; --warn:#E3AE5B; --warnBg:#352A17; --muted:#23272F;
+  --gr:#4EAAE6; --isc:#F29A4E; --me:#D66BB4; --sg:#8CC35C; --shadow:0 8px 30px rgba(0,0,0,.5);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:16px;padding-block:18px 90px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:14px}
+h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
+.sub{color:var(--ink3);font-size:13px;margin-top:2px}
+.proto{font-family:var(--mono);font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--warn);background:var(--warnBg);padding:3px 8px;border-radius:4px}
+.tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.tab{border:1px solid var(--line);background:var(--panel);color:var(--ink2);padding:5px 10px;border-radius:999px;font:inherit;font-size:13px;cursor:pointer}
+.tab[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.tab .n{font-family:var(--mono);font-size:11px;margin-left:4px;opacity:.75}
+.grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:14px;align-items:start}
+@media (max-width:860px){.grid{grid-template-columns:1fr}}
+.list{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.row{display:grid;grid-template-columns:22px 18px minmax(0,1fr) auto;gap:8px;align-items:center;padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.row:last-child{border-bottom:0}
+.row:hover{background:var(--hover)}
+.row.cur{background:var(--cursor);box-shadow:inset 3px 0 0 var(--accent)}
+.row input{margin:0;accent-color:var(--accent)}
+.src{font-family:var(--mono);font-size:10px;color:var(--ink3);text-transform:uppercase;letter-spacing:.05em}
+.ico{width:18px;height:18px;border-radius:4px;display:grid;place-items:center;font-family:var(--mono);font-size:10px;font-weight:500;color:var(--ink2);background:var(--muted)}
+.ttl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500}
+.meta{display:flex;gap:6px;align-items:center;min-width:0;color:var(--ink3);font-size:12px;white-space:nowrap;overflow:hidden}
+.dest{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--ink2);white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;flex:none}
+.chip{font-size:11px;padding:1px 6px;border-radius:4px;background:var(--muted);color:var(--ink2);white-space:nowrap}
+.chip.warn{background:var(--warnBg);color:var(--warn)}
+.chip.wait{background:var(--cursor);color:var(--accent)}
+.chip.ex{border:1px dashed var(--ink3);background:transparent}
+.empty{padding:40px 16px;text-align:center;color:var(--ink3)}
+.detail{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;position:sticky;top:calc(env(safe-area-inset-top,0px) + 12px)}
+.detail h2{font-size:16px;margin:4px 0 8px;font-weight:600;text-wrap:balance}
+.detail h2[contenteditable="true"]{outline:2px solid var(--accent);outline-offset:3px;border-radius:3px}
+.lbl{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);margin:14px 0 4px}
+.quote{border-left:2px solid var(--line);padding:2px 0 2px 10px;color:var(--ink2);font-size:13px}
+.why{color:var(--ink2);font-size:13px}
+.destbox{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.btnrow{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
+button.act{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 10px;border-radius:6px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+button.act:hover{background:var(--hover)}
+button.act.primary{background:var(--accent);color:var(--accentInk);border-color:var(--accent)}
+button:focus-visible,.tab:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;background:var(--bg);color:var(--ink2)}
+.primary kbd{background:transparent;color:inherit;border-color:rgba(255,255,255,.5)}
+.payload{font-family:var(--mono);font-size:11.5px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;white-space:pre-wrap;word-break:break-word;color:var(--ink2);margin:0}
+a{color:var(--accent)}
+.filtered{margin-top:10px;color:var(--ink3);font-size:12.5px}
+.legend{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--line);padding:8px 16px calc(8px + env(safe-area-inset-bottom,0px));display:flex;flex-wrap:wrap;gap:4px 14px;justify-content:center;font-size:12px;color:var(--ink2);z-index:5}
+.legend span{white-space:nowrap}
+@media (max-width:640px){.legend{display:none}.wrap{padding-block:14px 30px}}
+.overlay{position:fixed;inset:0;background:rgba(10,12,16,.35);display:grid;place-items:start center;padding:12vh 16px 16px;z-index:20}
+.picker{width:min(440px,100%);background:var(--panel);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden}
+.picker input{width:100%;border:0;border-bottom:1px solid var(--line);padding:12px 14px;font:inherit;font-size:15px;background:var(--panel);color:var(--ink);outline:none}
+.opts{max-height:50vh;overflow:auto}
+.opt{display:flex;gap:8px;align-items:center;padding:7px 14px;cursor:pointer;font-size:13.5px}
+.opt.on{background:var(--cursor)}
+.opt .p{color:var(--ink3)}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(56px + env(safe-area-inset-bottom,0px));background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:6px;font-size:13px;box-shadow:var(--shadow);z-index:30;max-width:calc(100% - 32px)}
+@media (max-width:640px){.toast{bottom:calc(16px + env(safe-area-inset-bottom,0px))}}
+.help table{width:100%;border-collapse:collapse;font-size:13px}
+.help td{padding:5px 14px;border-bottom:1px solid var(--line)}
+.help td:first-child{width:110px;white-space:nowrap}
+.done{padding:28px 18px;text-align:center}
+.done b{font-size:15px}
+@media (prefers-reduced-motion:no-preference){.row,.tab,button.act{transition:background .12s}}
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Todo Triage</h1>
+      <div class="sub">Monday 28 September · suggestions from meetings, email and Slack since your last pass</div>
+    </div>
+    <span class="proto" title="Actions are simulated">Prototype · nothing is sent to Todoist</span>
+  </header>
+
+  <div class="tabs" id="tabs" role="toolbar" aria-label="Filter by source"></div>
+
+  <div class="grid">
+    <div>
+      <div class="list" id="list" role="listbox" aria-label="Suggestions"></div>
+      <div class="filtered" id="filtered">Filtered out before you saw them: 19 emails (calendar acceptances, Uber and hotel receipts, CloudWatch alarms, a Workspace renewal nudge, and cold pitches from Bold Octave, Pegasus Prep and ZRG). Press <kbd>f</kbd> to show them.</div>
+    </div>
+    <aside class="detail" id="detail" aria-live="polite"></aside>
+  </div>
+</div>
+
+<div class="legend" aria-hidden="true">
+  <span><kbd>j</kbd>/<kbd>k</kbd> move</span>
+  <span><kbd>x</kbd> select</span>
+  <span><kbd>s</kbd> accept</span>
+  <span><kbd>1</kbd>–<kbd>4</kbd> GR · ISC · Me · SG</span>
+  <span><kbd>v</kbd> project/section</span>
+  <span><kbd>w</kbd> waiting on others</span>
+  <span><kbd>e</kbd> dismiss</span>
+  <span><kbd>u</kbd> not a duplicate</span>
+  <span><kbd>o</kbd> open source</span>
+  <span><kbd>Enter</kbd> edit</span>
+  <span><kbd>z</kbd> undo</span>
+  <span><kbd>Esc</kbd> clear selection</span>
+  <span><kbd>?</kbd> help</span>
+</div>
+
+<div id="layer"></div>
+
+<script>
+(function(){
+const PROJECTS = {
+  GR:{name:"GR",color:"var(--gr)",sections:["Reach Out","Team Logistics","Team Updates","Conferences","KubeCon / Armada / CNCF Batch","Arctos","Tech Projects","Blogs","Hiring","EA"]},
+  ISC:{name:"ISC",color:"var(--isc)",sections:["Reach Out","Logistics","Marketing","Quantum","Research","ISC Events","EA"]},
+  Me:{name:"Me",color:"var(--me)",sections:["Immediate","Logistics","Outreach","Tech","Cars","To Buy"]},
+  SG:{name:"SG",color:"var(--sg)",sections:[]},
+  Waiting:{name:"Waiting on others",color:"var(--ink3)",sections:[]}
+};
+const QUICK = ["GR","ISC","Me","SG"];
+const GM = "https://mail.google.com/mail/?authuser=alex@alexscammon.com#all/";
+const GN = "https://notes.granola.ai/d/";
+
+const items = [
+ {id:1,src:"meeting",title:"Send the Last Mile HPC for Channel Partners deck to Jon Stumpf",proj:"ISC",sec:"Reach Out",conf:"high",
+  origin:"Granola · “New note” · Fri 18 Sep",link:GN+"12b10ec7-7e40-44e0-8769-5046e11c6363",
+  quote:"Decision: send the “Last Mile HPC for Channel Partners” PDF deck (July 26th version). Remove the date brackets from the filename before sending.",
+  why:"Missed by the old job. This note fell in the Sep 18–23 gap and produced no tasks.",chips:["Backfill"]},
+ {id:2,src:"meeting",title:"Look into Arctos's 501(c)(3) tax filing status",proj:"GR",sec:"Arctos",conf:"high",
+  origin:"Granola · “New note” · Fri 18 Sep",link:GN+"12b10ec7-7e40-44e0-8769-5046e11c6363",
+  quote:"Entity has never received money, so formal tax status may never have been filed.",why:"Same missed note. Routed to your GR › Arctos section by topic.",chips:["Backfill"]},
+ {id:3,src:"meeting",title:"Update the HPC 2-pager to match the July 26 deck and add the Spectro Cloud logo",proj:"ISC",sec:"Marketing",conf:"high",
+  origin:"Granola · “New note” · Fri 18 Sep",link:GN+"12b10ec7-7e40-44e0-8769-5046e11c6363",
+  quote:"Technologies are mostly aligned; close remaining gaps and add SpectraCloud logo.",why:"Same missed note.",chips:["Backfill"]},
+ {id:4,src:"meeting",title:"Ping Marcus for the Kudo pilot requirements doc",proj:"ISC",sec:"Reach Out",conf:"high",due:"Today",
+  origin:"Granola · “New note” (Alex & Marcus) · Thu 24 Sep",link:GN+"7800b3e5-64c3-4b95-8d46-677176927343",
+  quote:"Confirm whether a doc exists that outlines what they actually wanted in the pilot.",why:"The old job created a task for the red-team idea from this note instead, which the note says is not the right time to pursue.",chips:[]},
+ {id:5,src:"email",title:"Reply to Vaish with the Samsara role Chris is targeting",proj:"Me",sec:"Outreach",conf:"high",
+  origin:"Email · Vaishnavi Srivathsan · Sat 26 Sep",link:GM+"thread-f:1877343710542492580",
+  quote:"Most of my inner circle has left Samsara :( I can still one or two people if needed. Which role is he interested in?",why:"A direct question to you with no reply yet.",chips:[]},
+ {id:6,src:"email",title:"Review the UTSA doc and the Carlos Garcia intro for Marcus",proj:"ISC",sec:"Research",conf:"high",
+  origin:"Email · Marcus Rabe · Fri 25 Sep",link:GM+"thread-f:1877333639310677068",
+  quote:"Can you please have a look at this together with the document I shared about UTSA? Seems like there is some more work coming our way here quickly.",
+  why:"Looks like your existing task “look at CUDO and UTSA stuff for marcus” (ISC, added 24 Sep). Accepting adds this email to that task as a comment instead of creating a new one.",chips:["Possible duplicate"],dup:true},
+ {id:7,src:"email",title:"OSC subcontractor agreements in place before STF contract signing (3 Oct)",proj:"Waiting",sec:"",conf:"med",waitOn:"Caitlin, Open Source Collective",resurface:"Fri 2 Oct",
+  origin:"Email · Alenka · Sun 27 Sep",link:GM+"thread-f:1875231838281405197",
+  quote:"We would need the agreements to be in place by the end of the coming week. The STF is preparing the contract which will be ready to be signed the earliest on 3rd of October.",
+  why:"Someone else owns this, but it blocks Arctos funding. Parked out of sight until Friday, then comes back as a follow-up in GR › Arctos unless the thread shows it's done.",chips:[]},
+ {id:8,src:"email",title:"Decide whether Armada takes part in IEEE CONFLUENCE TechFest (16–17 Oct, Delhi)",proj:"GR",sec:"KubeCon / Armada / CNCF Batch",conf:"med",
+  origin:"Email · IEEE VIPS · Fri 25 Sep",link:GM+"thread-f:1877335612317068615",
+  quote:"Hi Armada Team, I am connecting from the organizing team of CONFLUENCE — IEEE DAY 2026 TechFest…",
+  why:"You starred a copy of this, so it's already in your Todoist Inbox. Accepting files that task into this section instead of adding a second one.",chips:["Possible duplicate"],dup:true},
+ {id:9,src:"email",title:"Check whether any ISC customer account uses the AWS VPN features changing on 1 Dec",proj:"ISC",sec:"Logistics",conf:"low",
+  origin:"Email · AWS Health (aws-isc-prd) · Sun 27 Sep",link:GM+"thread-f:1877449634329299949",
+  quote:"Important notice about your AWS Account regarding VPN connections… Effective December 1, 2026…",why:"Low confidence. This is probably a notice for someone else on the team to handle.",chips:["Low confidence"]},
+ {id:10,src:"meeting",title:"Nikos to email Morasha to book the commercial follow-up",proj:"Waiting",sec:"",conf:"high",waitOn:"Nikos Terizakis (AI-on-Cloud)",resurface:"Mon 5 Oct",
+  origin:"Granola + Fireflies · Insight Softmax & AI-on-Cloud · Fri 25 Sep",link:GN+"19de1ffa-a57e-488b-a055-b24d9063b8d6",
+  quote:"Nikos to reach out by email; Marasha to confirm availability and book the slot.",why:"Owed to you. If Nikos's email arrives before 5 Oct, this closes itself.",chips:[]},
+ {id:11,src:"meeting",title:"Reissue Mihailo's C3 credentials via MDM if the corrected username doesn't work",proj:"GR",sec:"Tech Projects",conf:"high",
+  origin:"Granola · Secure Copy/Paste Internal Sync · Thu 24 Sep",link:GN+"69936f98-5231-46a0-b84d-892d55d39b47",
+  quote:"Mihailo to try correct username first; if still broken, Alexander to reissue credentials via MDM.",
+  why:"Overlaps your existing task “Provision C3 access for Mihailo and update his password in the MDM system”. Accepting adds this as a comment on it.",chips:["Possible duplicate"],dup:true},
+ {id:12,src:"meeting",title:"Mihailo to send the full dependency list to Tabatha",proj:"Waiting",sec:"",conf:"high",waitOn:"Mihailo Marinkovic",resurface:"Thu 1 Oct",
+  origin:"Granola · Secure Copy/Paste Internal Sync · Thu 24 Sep",link:GN+"69936f98-5231-46a0-b84d-892d55d39b47",
+  quote:"Citrix x2, OmniSight, Qt Core, Qt test, Catch2. Tabatha will work on ingesting into Artifactory.",why:"Blocks the C++ rewrite. Parked until Thursday.",chips:[]},
+ {id:13,src:"slack",title:"Example: a message you reacted to with :todo:",proj:"ISC",sec:"Logistics",conf:"high",example:true,
+  origin:"Slack · ISC workspace · example",link:"",
+  quote:"Slack isn't connected yet. Once it is, messages you react to with :todo: show up here with the channel, sender and a link back to the thread.",why:"Explicit capture, so it would normally skip triage and go straight to Todoist. It's shown here so you can see the format.",chips:["Example"]},
+ {id:14,src:"slack",title:"Example: a direct question to you in a GR-OSS thread",proj:"GR",sec:"Reach Out",conf:"med",example:true,
+  origin:"Slack · GR-OSS workspace · example",link:"",
+  quote:"Mentions and DMs that ask you for something land here for triage, next to the email suggestions.",why:"Placeholder until Slack is connected.",chips:["Example"]},
+ {id:15,src:"system",title:"Open 2 Granola notes that still don't have a summary",proj:"Me",sec:"Immediate",conf:"high",example:true,
+  origin:"Granola check · example",link:"https://notes.granola.ai/",
+  quote:"Meetings on your calendar that have a Granola note but no AI summary yet, each with a direct link. Once a summary exists, the meeting job picks it up.",why:"Replaces your weekly manual sweep. The items listed here are illustrative.",chips:["Example"]}
+];
+items.forEach(i=>{i.status="pending";i.origTitle=i.title;i.dupOrig=!!i.dup;i.chips=i.chips.filter(c=>c!=="Possible duplicate")});
+const chipsFor=i=>(i.dup?["Possible duplicate"]:[]).concat(i.chips);
+const destLabel=i=>i.proj==="Waiting"?`Waiting on others (back ${i.resurface})`:i.dup?"a comment on the existing task":`${PROJECTS[i.proj].name}${i.sec?" › "+i.sec:""}`;
+
+const SRC = {meeting:{label:"Meetings",ico:"M"},email:{label:"Email",ico:"@"},slack:{label:"Slack",ico:"#"},system:{label:"Checks",ico:"!"}};
+let filter="all", cursor=0, selected=new Set(), undo=[], editing=false, overlay=null, showFiltered=false;
+
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function visible(){return items.filter(i=>i.status==="pending"&&(filter==="all"||(filter==="waiting"?i.proj==="Waiting":i.src===filter)))}
+function destHTML(i){
+  const p=PROJECTS[i.proj];
+  if(i.proj==="Waiting") return `<span class="dest"><span class="dot" style="background:${p.color}"></span>Waiting · ${esc(i.resurface)}</span>`;
+  return `<span class="dest"><span class="dot" style="background:${p.color}"></span>${p.name}${i.sec?` › ${esc(i.sec)}`:""}</span>`;
+}
+function renderTabs(){
+  const pend=items.filter(i=>i.status==="pending");
+  const defs=[["all","All",pend.length],["meeting","Meetings",pend.filter(i=>i.src==="meeting").length],["email","Email",pend.filter(i=>i.src==="email").length],["slack","Slack",pend.filter(i=>i.src==="slack").length],["waiting","Waiting on others",pend.filter(i=>i.proj==="Waiting").length],["system","Checks",pend.filter(i=>i.src==="system").length]];
+  $("#tabs").innerHTML=defs.map(([k,l,n])=>`<button class="tab" data-f="${k}" aria-pressed="${filter===k}">${l}<span class="n">${n}</span></button>`).join("");
+  $("#tabs").querySelectorAll(".tab").forEach(b=>b.onclick=()=>{filter=b.dataset.f;cursor=0;render()});
+}
+function renderList(){
+  const v=visible();
+  if(cursor>=v.length) cursor=Math.max(0,v.length-1);
+  const L=$("#list");
+  if(!v.length){
+    const acc=items.filter(i=>i.status==="accepted").length, dis=items.filter(i=>i.status==="dismissed").length, wt=items.filter(i=>i.status==="waiting").length;
+    L.innerHTML=`<div class="done"><b>Nothing left in this view.</b><div class="sub" style="margin-top:6px">This session: ${acc} accepted, ${wt} parked as waiting, ${dis} dismissed. Press <kbd>z</kbd> to undo the last one.</div></div>`;
+    return;
+  }
+  L.innerHTML=v.map((i,idx)=>`
+    <div class="row${idx===cursor?" cur":""}" role="option" aria-selected="${idx===cursor}" data-idx="${idx}">
+      <input type="checkbox" id="sel-${i.id}" aria-label="Select" ${selected.has(i.id)?"checked":""}>
+      <span class="ico" title="${SRC[i.src].label}">${SRC[i.src].ico}</span>
+      <div style="min-width:0">
+        <div class="ttl">${esc(i.title)}</div>
+        <div class="meta">${esc(i.origin)}${chipsFor(i).map(c=>` <span class="chip ${c==="Example"?"ex":(c==="Possible duplicate"||c==="Low confidence")?"warn":""}">${c}</span>`).join("")}</div>
+      </div>
+      <div>${destHTML(i)}</div>
+    </div>`).join("");
+  L.querySelectorAll(".row").forEach(r=>{
+    const idx=+r.dataset.idx;
+    r.onclick=e=>{ if(e.target.tagName==="INPUT"){toggleSel(v[idx].id);return;} cursor=idx; render(); };
+  });
+  const cur=L.querySelector(".row.cur"); if(cur&&cur.scrollIntoView) cur.scrollIntoView({block:"nearest"});
+}
+function payload(i){
+  if(i.proj==="Waiting") return `Project: Waiting on others (hidden)\nOwner: ${i.waitOn}\nResurface: ${i.resurface}, as a follow-up in the right project\nAuto-close: yes, if later email, Slack or meetings show it's done\nLink: ${i.link}`;
+  if(i.dup) return `No new task. Adds a comment to the existing task:\n“${i.title}”\n+ link back to the source`;
+  return `Task: ${i.title}${i.due?`\nDue: ${i.due}`:""}\nProject: ${PROJECTS[i.proj].name}${i.sec?` › ${i.sec}`:""}\nLabel: @${i.src==="meeting"?"meeting":i.src==="email"?"from-email":i.src==="slack"?"from-slack":"check"}\nDescription:\n  ${i.origin}\n  ${i.link||"(link to source)"}\n  “${i.quote.slice(0,90)}${i.quote.length>90?"…":""}”`;
+}
+function renderDetail(){
+  const v=visible(), i=v[cursor], D=$("#detail");
+  if(!i){D.innerHTML=`<div class="empty">Select a suggestion to see where it came from.</div>`;return}
+  const src=i.link?`<a href="${esc(i.link)}" target="_blank" rel="noopener" id="srclink">Open source ↗</a>`:`<span class="sub">No link yet (example)</span>`;
+  D.innerHTML=`
+    <div class="src">${SRC[i.src].label} · confidence ${i.conf}</div>
+    <h2 id="dtitle" spellcheck="false">${esc(i.title)}</h2>
+    <div class="destbox">${destHTML(i)} ${i.proj==="Waiting"?`<span class="chip wait">Owner: ${esc(i.waitOn)}</span>`:""} ${i.due?`<span class="chip">Due ${esc(i.due)}</span>`:""}</div>
+    <div class="lbl">From</div>
+    <div class="why">${esc(i.origin)} · ${src}</div>
+    <div class="lbl">What it said</div>
+    <div class="quote">${esc(i.quote)}</div>
+    <div class="lbl">Why it's here</div>
+    <div class="why">${esc(i.dupOrig&&!i.dup?"You marked this as not a duplicate, so accepting creates a new task.":i.why)}</div>
+    <div class="btnrow">
+      <button class="act primary" data-a="accept"><kbd>s</kbd> Accept</button>
+      <button class="act" data-a="move"><kbd>v</kbd> Project/section</button>
+      <button class="act" data-a="wait"><kbd>w</kbd> Waiting</button>
+      <button class="act" data-a="edit"><kbd>↵</kbd> Edit</button>
+      ${i.dupOrig?`<button class="act" data-a="undup"><kbd>u</kbd> ${i.dup?"Not a duplicate":"Mark as duplicate again"}</button>`:""}
+      <button class="act" data-a="dismiss"><kbd>e</kbd> Dismiss</button>
+    </div>
+    <div class="lbl">What accepting does</div>
+    <pre class="payload">${esc(payload(i))}</pre>`;
+  D.querySelectorAll("button.act").forEach(b=>b.onclick=()=>act(b.dataset.a));
+}
+function render(){renderTabs();renderList();renderDetail()}
+
+function targets(){
+  const v=visible();
+  if(selected.size) return items.filter(i=>selected.has(i.id)&&i.status==="pending");
+  return v[cursor]?[v[cursor]]:[];
+}
+function toggleSel(id){selected.has(id)?selected.delete(id):selected.add(id);render()}
+function toast(msg){
+  const t=document.createElement("div");t.className="toast";t.textContent=msg;
+  document.body.appendChild(t);setTimeout(()=>t.remove(),2200);
+}
+function setStatus(list,status,label){
+  if(!list.length)return;
+  undo.push(list.map(i=>({i,status:i.status,proj:i.proj,sec:i.sec,dup:i.dup})));
+  list.forEach(i=>i.status=status);
+  selected.clear();
+  const n=list.length;
+  toast(`${label} ${n>1?n+" items":"“"+list[0].title.slice(0,48)+(list[0].title.length>48?"…":"")+"”"} · z to undo`);
+  render();
+}
+function act(a){
+  const t=targets(); if(!t.length&&a!=="undo")return;
+  if(a==="accept"){
+    undo.push(t.map(i=>({i,status:i.status,proj:i.proj,sec:i.sec,dup:i.dup})));
+    t.forEach(i=>i.status=i.proj==="Waiting"?"waiting":"accepted");
+    selected.clear();
+    toast(t.length===1?`Accepted → ${destLabel(t[0])} · z to undo`:`Accepted ${t.length} items, each to its destination · z to undo`);
+    render();
+  }
+  else if(a==="undup"){
+    const d=t.filter(i=>i.dupOrig); if(!d.length){toast("This one isn't flagged as a duplicate");return}
+    undo.push(d.map(i=>({i,status:i.status,proj:i.proj,sec:i.sec,dup:i.dup})));
+    d.forEach(i=>i.dup=!i.dup);
+    toast(d[0].dup?"Flagged as a duplicate again":"Not a duplicate: accepting will create a new task");render();
+  }
+  else if(a==="dismiss") setStatus(t,"dismissed","Dismissed:");
+  else if(a==="wait"){
+    undo.push(t.map(i=>({i,status:i.status,proj:i.proj,sec:i.sec,dup:i.dup})));
+    t.forEach(i=>{i.proj="Waiting";i.waitOn=i.waitOn||"(owner from source)";i.resurface=i.resurface||"in 7 days";i.status="waiting"});
+    selected.clear();toast(`Parked ${t.length>1?t.length+" items":"1 item"} in Waiting on others · z to undo`);render();
+  }
+  else if(a==="move") openPicker(t);
+  else if(a==="edit") startEdit();
+}
+function quickProject(k){
+  const t=targets(); if(!t.length)return;
+  undo.push(t.map(i=>({i,status:i.status,proj:i.proj,sec:i.sec,dup:i.dup})));
+  t.forEach(i=>{ if(i.proj!==k){i.proj=k;i.sec=PROJECTS[k].sections[0]||""} i.dup=false; });
+  toast(`Moved to ${k}${t.length===1&&t[0].sec?" › "+t[0].sec:""}. Press s to accept, or v to pick a section`);render();
+}
+function doUndo(){
+  const last=undo.pop(); if(!last){toast("Nothing to undo");return}
+  last.forEach(({i,status,proj,sec,dup})=>{i.status=status;i.proj=proj;i.sec=sec;if(dup!==undefined)i.dup=dup});
+  toast("Undone");render();
+}
+function startEdit(){
+  const h=$("#dtitle"); if(!h)return;
+  const i=visible()[cursor];
+  editing=true;h.contentEditable="true";h.focus();
+  const r=document.createRange();r.selectNodeContents(h);const s=getSelection();s.removeAllRanges();s.addRange(r);
+  const finish=save=>{ if(!editing)return; editing=false;h.contentEditable="false"; if(save){const v=h.textContent.trim(); if(v) i.title=v;} render(); };
+  h.onkeydown=e=>{ if(e.key==="Enter"){e.preventDefault();finish(true)} if(e.key==="Escape"){e.preventDefault();finish(false)} e.stopPropagation(); };
+  h.onblur=()=>finish(true);
+}
+function openPicker(t){
+  const opts=[];
+  ["GR","ISC","Me","SG"].forEach(k=>{
+    opts.push({k,sec:"",label:PROJECTS[k].name,path:"project inbox"});
+    PROJECTS[k].sections.forEach(s=>opts.push({k,sec:s,label:s,path:PROJECTS[k].name}));
+  });
+  opts.push({k:"Waiting",sec:"",label:"Waiting on others",path:"hidden until resurface date"});
+  let q="",on=0;
+  const L=$("#layer");
+  L.innerHTML=`<div class="overlay" id="ov"><div class="picker" role="dialog" aria-label="Choose project and section"><input id="pq" placeholder="Type a project or section…" autocomplete="off"><div class="opts" id="po"></div></div></div>`;
+  overlay="picker";
+  const inp=$("#pq"), box=$("#po");
+  const list=()=>opts.filter(o=>(o.label+" "+o.path).toLowerCase().includes(q.toLowerCase()));
+  const draw=()=>{const l=list(); if(on>=l.length)on=Math.max(0,l.length-1);
+    box.innerHTML=l.map((o,n)=>`<div class="opt${n===on?" on":""}" data-n="${n}"><span class="dot" style="background:${PROJECTS[o.k].color}"></span>${esc(o.label)} <span class="p">· ${esc(o.path)}</span></div>`).join("")||`<div class="opt p">No match</div>`;
+    box.querySelectorAll(".opt[data-n]").forEach(el=>el.onclick=()=>choose(list()[+el.dataset.n]));
+    const c=box.querySelector(".on"); if(c)c.scrollIntoView({block:"nearest"});};
+  const close=()=>{L.innerHTML="";overlay=null;};
+  const choose=o=>{ if(!o)return; close();
+    undo.push(t.map(i=>({i,status:i.status,proj:i.proj,sec:i.sec,dup:i.dup})));
+    t.forEach(i=>{i.proj=o.k;i.sec=o.sec;i.dup=false; if(o.k==="Waiting"){i.waitOn=i.waitOn||"(owner from source)";i.resurface=i.resurface||"in 7 days"}});
+    toast(`Destination set: ${o.k==="Waiting"?"Waiting on others":PROJECTS[o.k].name+(o.sec?" › "+o.sec:"")}. Press s to accept`);render(); };
+  inp.oninput=()=>{q=inp.value;on=0;draw()};
+  inp.onkeydown=e=>{
+    if(e.key==="ArrowDown"||(e.ctrlKey&&e.key==="n")){e.preventDefault();on++;draw()}
+    else if(e.key==="ArrowUp"||(e.ctrlKey&&e.key==="p")){e.preventDefault();on=Math.max(0,on-1);draw()}
+    else if(e.key==="Enter"){e.preventDefault();choose(list()[on])}
+    else if(e.key==="Escape"){e.preventDefault();close()}
+    e.stopPropagation();
+  };
+  $("#ov").onclick=e=>{if(e.target.id==="ov")close()};
+  draw();inp.focus();
+}
+function openHelp(){
+  const rows=[["j / k","Next / previous suggestion"],["x","Select (actions apply to all selected)"],["s","Accept into the suggested project and section"],["1 2 3 4","Change project to GR, ISC, Me or SG"],["v","Pick any project and section (type to filter)"],["w","Park in Waiting on others"],["e","Dismiss, like Gmail's archive (feeds back to reduce noise)"],["u","Not a duplicate: create a new task instead of a comment"],["o","Open the original email, thread or note"],["Enter","Edit the task wording"],["z","Undo"],["f","Show what was filtered out"],["Esc","Clear selection, or close this"]];
+  $("#layer").innerHTML=`<div class="overlay" id="ov"><div class="picker help" role="dialog" aria-label="Keyboard shortcuts"><div style="padding:12px 14px;font-weight:600">Keyboard shortcuts</div><table>${rows.map(r=>`<tr><td><kbd>${r[0]}</kbd></td><td>${r[1]}</td></tr>`).join("")}</table></div></div>`;
+  overlay="help"; $("#ov").onclick=()=>{$("#layer").innerHTML="";overlay=null};
+}
+
+document.addEventListener("keydown",e=>{
+  if(editing)return;
+  if(overlay){ if(e.key==="Escape"){$("#layer").innerHTML="";overlay=null} return; }
+  if(e.key==="Escape"){ if(selected.size){e.preventDefault();selected.clear();toast("Selection cleared");render()} return; }
+  if(e.metaKey||e.ctrlKey||e.altKey)return;
+  const tag=(e.target.tagName||"").toLowerCase(); if(tag==="input"&&e.target.type!=="checkbox")return;
+  const v=visible(), k=e.key;
+  const handled=()=>e.preventDefault();
+  if(k==="j"||k==="ArrowDown"){handled();cursor=Math.min(v.length-1,cursor+1);render()}
+  else if(k==="k"||k==="ArrowUp"){handled();cursor=Math.max(0,cursor-1);render()}
+  else if(k==="x"){handled(); if(v[cursor]) toggleSel(v[cursor].id)}
+  else if(k==="s"||k==="S"){handled();act("accept")}
+  else if(k==="u"){handled();act("undup")}
+  else if(k==="e"||k==="#"){handled();act("dismiss")}
+  else if(k==="w"){handled();act("wait")}
+  else if(k==="v"){handled();act("move")}
+  else if(k==="Enter"){handled();act("edit")}
+  else if(k==="z"){handled();doUndo()}
+  else if(["1","2","3","4"].includes(k)){handled();quickProject(QUICK[+k-1])}
+  else if(k==="o"){handled(); const a=$("#srclink"); if(a) a.click(); else toast("No link for this example yet")}
+  else if(k==="?"){handled();openHelp()}
+  else if(k==="f"){handled(); showFiltered=!showFiltered;
+    $("#filtered").innerHTML=showFiltered
+      ?`Filtered out (sample): “Accepted: Nanda + Alex S Connect” · “[Business] Your Saturday afternoon trip with Uber” · “Invoice” (Sheraton Zürich) · “OK: hlkit-node-tokyo-data-disk-high” ×4 · “Don't miss out! Your Google Workspace renewal” · “Re: Ops between systems” (Bold Octave) · “Alexander: J.P. Morgan x Harvard.” (Pegasus Prep) · “data science consulting demand” (ZRG). Press <kbd>f</kbd> to hide.`
+      :`Filtered out before you saw them: 19 emails (calendar acceptances, Uber and hotel receipts, CloudWatch alarms, a Workspace renewal nudge, and cold pitches from Bold Octave, Pegasus Prep and ZRG). Press <kbd>f</kbd> to show them.`;}
+});
+
+render();
+})();
+</script>

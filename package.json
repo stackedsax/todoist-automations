@@ -1,36 +1,39 @@
 {
-  "name": "gmail-stars-to-todoist",
+  "name": "todoist-automations",
   "version": "1.0.0",
-  "description": "A Google Apps Script that automatically creates Todoist tasks from starred Gmail messages",
+  "description": "Google Apps Script automations that capture todos from meetings (Granola/Fireflies), email and Slack into Todoist, with a triage web app",
   "main": "Code.js",
   "scripts": {
     "push": "npx clasp push",
     "deploy": "npx clasp deploy",
     "open": "npx clasp open",
-    "setup": "npx clasp create --title 'Gmail Stars to Todoist' --type standalone && npx clasp push",
-    "lint": "eslint Code.js",
-    "lint:fix": "eslint Code.js --fix",
+    "setup": "npx clasp create --title 'Todoist Automations' --type standalone && npx clasp push",
+    "lint": "eslint *.js __tests__",
+    "lint:fix": "eslint *.js __tests__ --fix",
     "test": "jest"
   },
   "keywords": [
-    "gmail",
     "todoist",
     "google-apps-script",
     "automation",
     "productivity",
-    "email",
+    "gmail",
+    "granola",
+    "fireflies",
+    "slack",
+    "meetings",
     "task-management"
   ],
   "author": "Contributors",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/username/gmail-stars-to-todoist.git"
+    "url": "https://github.com/stackedsax/todoist-automations.git"
   },
   "bugs": {
-    "url": "https://github.com/username/gmail-stars-to-todoist/issues"
+    "url": "https://github.com/stackedsax/todoist-automations/issues"
   },
-  "homepage": "https://github.com/username/gmail-stars-to-todoist#readme",
+  "homepage": "https://github.com/stackedsax/todoist-automations#readme",
   "engines": {
     "node": ">=4.7.4"
   },
