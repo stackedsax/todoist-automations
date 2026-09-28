@@ -5,8 +5,13 @@
  *
  * API reference: https://docs.fireflies.ai/ (GraphQL endpoint https://api.fireflies.ai/graphql,
  * `Authorization: Bearer <FIREFLIES_API_KEY>`).
- *   Query `transcripts(fromDate: DateTime, toDate: DateTime, limit: Int (max 50), skip: Int)`
- *     https://docs.fireflies.ai/graphql-api/query/transcripts
+ *   Query `transcripts(fromDate: DateTime, toDate: DateTime, limit: Int (max 50), skip: Int,
+ *     user_id: String, mine: Boolean)` -- https://docs.fireflies.ai/graphql-api/query/transcripts
+ *     `user_id` = "meetings that have this user ID as the organizer or participant"; `mine` =
+ *     "meetings that have the API key owner as the organizer" (organizer ONLY, so it would drop
+ *     meetings Alex merely attended -- not used). No sort order is documented.
+ *   Query `user` without id -> the API key owner {user_id email name}
+ *     https://docs.fireflies.ai/graphql-api/query/user
  *   Query `transcript(id: String!)`
  *     https://docs.fireflies.ai/graphql-api/query/transcript
  *   Transcript fields used: id title date (epoch ms) duration (minutes) organizer_email
@@ -20,11 +25,25 @@
  * as a hint only. Speaker mapping: identity.myNames -> "me"; identity.notMe and any other real
  * name -> "them"; no name, generic "Speaker N", or a bare first name shared with Alex
  * (e.g. just "Alex") -> "unknown".
+ *
+ * Whose meetings: on a team/Business key `transcripts` can include teammates' meetings, so the
+ * listing is filtered server-side with `user_id` = the key owner's id (from `user`, cached 6h),
+ * and client-side: a meeting that lists emails but none of identity.myEmails is dropped.
+ *
+ * Rate limits (https://docs.fireflies.ai/fundamentals/limits): Free 50 requests/day, Pro 500/day,
+ * Business 60/min. listSince makes 1 `user` call per 6h, 1 list call per 50 meetings and 1
+ * `transcript` call per meeting whose sentences it fetches; pass needTranscript/transcriptGraceMs
+ * to skip sentences for meetings the caller will not process yet.
  */
 const Fireflies = {
   URL: 'https://api.fireflies.ai/graphql',
   PAGE_SIZE: 50,
   MAX_PAGES: 40,
+  /** Listing pages allowed after the deadline expires before the listing counts as incomplete. */
+  LIST_OVERRUN_PAGES: 3,
+  USER_CACHE_KEY: 'fireflies.ownerUserId',
+  USER_CACHE_SECONDS: 21600,
+  ownerId_: undefined,
 
   LIST_FIELDS_: 'id title date duration organizer_email participants ' +
     'meeting_attendees { displayName email name } summary { overview action_items } transcript_url',
@@ -54,35 +73,85 @@ const Fireflies = {
   },
 
   /**
-   * Raw transcript list (no sentences) since `fromDate`, paging with limit/skip.
+   * The API key owner's Fireflies user_id (memory + CacheService 6h), or null when the `user`
+   * query fails (the client-side email guard still applies then).
+   */
+  ownerUserId() {
+    if (Fireflies.ownerId_ !== undefined) return Fireflies.ownerId_;
+    let cache = null;
+    try { cache = CacheService.getScriptCache(); } catch (e) { cache = null; }
+    const hit = cache ? cache.get(Fireflies.USER_CACHE_KEY) : null;
+    if (hit) { Fireflies.ownerId_ = hit; return hit; }
+    let id = null;
+    try {
+      const u = Fireflies.graphql('query User { user { user_id email name } }', {}).user;
+      id = u && u.user_id ? String(u.user_id) : null;
+    } catch (e) {
+      console.log('[Fireflies] owner lookup failed; listing without user_id: ' + (e && e.message));
+      id = null;
+    }
+    Fireflies.ownerId_ = id;
+    if (id && cache) {
+      try { cache.put(Fireflies.USER_CACHE_KEY, id, Fireflies.USER_CACHE_SECONDS); } catch (e) { /* best effort */ }
+    }
+    return id;
+  },
+
+  /**
+   * Raw transcript list (no sentences) since `fromDate`, paging with limit/skip, filtered to the
+   * key owner's meetings (user_id). The returned array carries `complete`: false when paging was
+   * cut (deadline overrun or maxPages) and more meetings may exist.
    * @param {{fromDate?: (Date|string), toDate?: (Date|string), limit?: number, maxPages?: number,
-   *          deadline?: {expired: function(): boolean}}} [opts]
+   *          userId?: (string|null), deadline?: {expired: function(): boolean}}} [opts]
+   *   userId: override the owner filter (null = no server-side filter).
+   *   deadline: once expired, at most LIST_OVERRUN_PAGES more pages are fetched.
    */
   listTranscripts(opts) {
     const o = opts || {};
     const limit = Math.min(Fireflies.PAGE_SIZE, o.limit || Fireflies.PAGE_SIZE);
     const maxPages = o.maxPages || Fireflies.MAX_PAGES;
-    const q = 'query Transcripts($fromDate: DateTime, $toDate: DateTime, $limit: Int, $skip: Int) {' +
-      ' transcripts(fromDate: $fromDate, toDate: $toDate, limit: $limit, skip: $skip) { ' +
+    const userId = o.userId !== undefined ? o.userId : Fireflies.ownerUserId();
+    const q = 'query Transcripts($fromDate: DateTime, $toDate: DateTime, $limit: Int, $skip: Int, $userId: String) {' +
+      ' transcripts(fromDate: $fromDate, toDate: $toDate, limit: $limit, skip: $skip, user_id: $userId) { ' +
       Fireflies.LIST_FIELDS_ + ' } }';
     const out = [];
     const seen = {};
+    let complete = false;
+    let overrun = 0;
     for (let page = 0; page < maxPages; page++) {
-      if (page > 0 && o.deadline && o.deadline.expired()) break;
+      if (page > 0 && o.deadline && o.deadline.expired() && ++overrun > Fireflies.LIST_OVERRUN_PAGES) break;
       const vars = { limit: limit, skip: page * limit };
       const from = Fireflies.iso_(o.fromDate);
       const to = Fireflies.iso_(o.toDate);
       if (from) vars.fromDate = from;
       if (to) vars.toDate = to;
+      if (userId) vars.userId = userId;
       const list = Fireflies.graphql(q, vars).transcripts || [];
       list.forEach(function (t) {
         if (!t || !t.id || seen[t.id]) return;
         seen[t.id] = true;
         out.push(t);
       });
-      if (list.length < limit) break;
+      if (list.length < limit) { complete = true; break; }
     }
+    out.complete = complete;
     return out;
+  },
+
+  /**
+   * Client-side guard: false when the meeting lists emails (organizer, participants,
+   * attendees) and none of them is one of identity.myEmails.
+   */
+  isMine_(raw) {
+    const emails = [];
+    if (raw.organizer_email) emails.push(raw.organizer_email);
+    (raw.participants || []).forEach(function (p) {
+      String(p || '').split(/[,;]/).forEach(function (x) { if (x.trim()) emails.push(x); });
+    });
+    (raw.meeting_attendees || []).forEach(function (a) { if (a && a.email) emails.push(a.email); });
+    const parsed = emails.map(function (e) { return Util.parseEmail(String(e)); }).filter(Boolean);
+    if (!parsed.length) return true;
+    return parsed.some(function (e) { return Config.isMyEmail(e); });
   },
 
   /** One raw transcript including sentences, or null if Fireflies returns none. */
@@ -101,34 +170,79 @@ const Fireflies = {
   /**
    * Meetings recorded since `fromDate`, oldest first.
    * By default meetings without a summary yet (still processing) are skipped so a later run
-   * picks them up, and each meeting's sentences are fetched as its transcript.
+   * picks them up, meetings that are not Alex's (isMine_) are dropped, and each meeting's
+   * sentences are fetched as its transcript, OLDEST FIRST.
+   *
+   * Never silently short: if the listing itself is cut at the deadline, this throws
+   * (name 'FirefliesIncompleteError') so the caller keeps its cursor. When the deadline expires
+   * during the per-meeting sentence fetches, the remaining (newer) meetings are still returned,
+   * with transcript null and `deferred: true`, `transcriptDeferred: 'deadline'`; the caller must
+   * not process them this run (Meetings' own deadline check treats them as pending).
+   * Meetings skipped by needTranscript/transcriptGraceMs come back with transcript null and
+   * `transcriptDeferred: 'caller'` / `'grace'` (NOT `deferred`).
    * @param {(Date|string)} fromDate
    * @param {{transcripts?: boolean, includeUnsummarised?: boolean, skipIds?: function(string): boolean,
+   *          needTranscript?: function(string, Date): boolean, transcriptGraceMs?: number,
    *          toDate?: (Date|string), deadline?: {expired: function(): boolean}}} [opts]
    *   skipIds(id) -> true to skip (e.g. already in the ledger) before fetching sentences.
+   *   needTranscript(id, start) -> false to skip the sentences fetch for that meeting.
+   *   transcriptGraceMs: skip the sentences fetch for meetings that started less than this ago
+   *     (e.g. Fireflies-only recordings the caller defers while waiting for Granola).
    * @return {Object[]} Meetings
    */
   listSince(fromDate, opts) {
     const o = opts || {};
     const withTranscripts = o.transcripts !== false;
     const raws = Fireflies.listTranscripts({ fromDate: fromDate, toDate: o.toDate, deadline: o.deadline });
+    if (raws.complete === false && o.deadline && o.deadline.expired()) {
+      const err = new Error('Fireflies listing incomplete at deadline (' + raws.length + ' listed); will retry');
+      err.name = 'FirefliesIncompleteError';
+      throw err;
+    }
+    const nowMs = Util.now().getTime();
+    const candidates = raws.filter(function (raw) {
+      if (o.skipIds && o.skipIds(String(raw.id))) return false;
+      if (!o.includeUnsummarised && !Fireflies.hasSummary_(raw)) return false;
+      if (!Fireflies.isMine_(raw)) {
+        console.log('[Fireflies] skipping ' + raw.id + ': none of my emails among its participants');
+        return false;
+      }
+      return true;
+    }).map(function (raw) { return { raw: raw, start: Fireflies.date_(raw.date) }; });
+    candidates.sort(function (a, b) {
+      return (a.start ? a.start.getTime() : 0) - (b.start ? b.start.getTime() : 0);
+    });
     const out = [];
-    for (let i = 0; i < raws.length; i++) {
-      const raw = raws[i];
-      if (o.skipIds && o.skipIds(String(raw.id))) continue;
-      if (!o.includeUnsummarised && !Fireflies.hasSummary_(raw)) continue;
-      if (withTranscripts && o.deadline && o.deadline.expired()) break;
+    let cut = false;
+    candidates.forEach(function (c) {
+      const raw = c.raw;
+      if (!withTranscripts) { out.push(Fireflies.toMeeting(raw)); return; }
+      let skip = null;
+      if (o.transcriptGraceMs && c.start && nowMs - c.start.getTime() < o.transcriptGraceMs) skip = 'grace';
+      else if (o.needTranscript && o.needTranscript(String(raw.id), c.start) === false) skip = 'caller';
+      if (skip) {
+        const m = Fireflies.toMeeting(raw);
+        m.transcriptDeferred = skip;
+        out.push(m);
+        return;
+      }
+      if (!cut && o.deadline && o.deadline.expired()) cut = true;
+      if (cut) {
+        const m = Fireflies.toMeeting(raw);
+        m.deferred = true;
+        m.transcriptDeferred = 'deadline';
+        out.push(m);
+        return;
+      }
       let full = raw;
-      if (withTranscripts) {
-        try {
-          full = Fireflies.getTranscript(raw.id) || raw;
-        } catch (e) {
-          console.log('[Fireflies] transcript ' + raw.id + ' failed: ' + (e && e.message));
-          full = raw;
-        }
+      try {
+        full = Fireflies.getTranscript(raw.id) || raw;
+      } catch (e) {
+        console.log('[Fireflies] transcript ' + raw.id + ' failed: ' + (e && e.message));
+        full = raw;
       }
       out.push(Fireflies.toMeeting(full));
-    }
+    });
     out.sort(function (a, b) { return a.start.getTime() - b.start.getTime(); });
     return out;
   },
@@ -187,7 +301,7 @@ const Fireflies = {
   },
 
   speakerOf_(name) {
-    if (!name || /^speaker\s*\d*$/i.test(name)) return 'unknown';
+    if (!name || /^speaker(\s*[a-z0-9]+)?$/i.test(name)) return 'unknown';
     if (Config.isNotMe(name)) return 'them';
     if (Config.isMyName(name)) return 'me';
     const n = name.trim().toLowerCase();

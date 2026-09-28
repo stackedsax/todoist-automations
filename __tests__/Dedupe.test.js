@@ -194,11 +194,17 @@ describe('Dedupe.matchTask', () => {
     expect(ctx.Dedupe.matchTask(item, tasks, [])).toBeNull();
   });
 
-  test('notDuplicateFeedback reads Store and survives errors', () => {
+  test('notDuplicateFeedback reads Store (not_duplicate + undup undo rows only) and survives errors', () => {
     const ctx = setup();
-    ctx.Store.feedbackRecent.mockReturnValue([{ type: 'not_duplicate' }]);
-    expect(ctx.Dedupe.notDuplicateFeedback()).toEqual([{ type: 'not_duplicate' }]);
-    expect(ctx.Store.feedbackRecent).toHaveBeenCalledWith(200, 'not_duplicate');
+    ctx.Store.feedbackRecent.mockReturnValue([
+      { type: 'undone', detail: { action: 'undup' } },
+      { type: 'undone', detail: { action: 'dismiss' } },
+      { type: 'dismissed' },
+      { type: 'not_duplicate' }
+    ]);
+    expect(ctx.Dedupe.notDuplicateFeedback()).toEqual([{ type: 'undone', detail: { action: 'undup' } }, { type: 'not_duplicate' }]);
+    expect(ctx.Store.feedbackRecent).toHaveBeenCalledWith(1000);
+    expect(ctx.Dedupe.notDuplicateFeedback(1)).toEqual([{ type: 'undone', detail: { action: 'undup' } }]);
     ctx.Store.feedbackRecent.mockImplementation(() => { throw new Error('no sheet'); });
     expect(ctx.Dedupe.notDuplicateFeedback()).toEqual([]);
   });
@@ -217,5 +223,74 @@ describe('Dedupe helpers', () => {
     const ctx = setup();
     expect(ctx.Dedupe.titleSimilarity('Secure Copy/Paste Sync', 'secure copy paste sync')).toBe(1);
     expect(ctx.Dedupe.titleSimilarity('New note', 'Weekly')).toBe(0);
+  });
+});
+
+describe('Dedupe not_duplicate reversals', () => {
+  const tasks = [{ id: '101', content: 'Send Last Mile HPC deck to Jon' }];
+  const item = { id: 'q_1', title: 'Send Last Mile HPC deck to Jon' };
+  const nd = (at, extra) => Object.assign({ at, type: 'not_duplicate', queueId: 'q_1', title: item.title, detail: { dupTaskId: '101', dupTaskTitle: 'Send Last Mile HPC deck to Jon' } }, extra || {});
+  const undo = (at, actionAt) => ({ at, type: 'undone', queueId: 'q_1', title: item.title, detail: { action: 'undup', at: actionAt } });
+
+  test('an undone undup withdraws the not_duplicate row it wrote, so the match comes back', () => {
+    const ctx = setup();
+    const fb = [undo('2026-09-28T10:05:00Z', '2026-09-28T10:00:00.000Z'), nd('2026-09-28T10:00:00.004Z')];
+    expect(ctx.Dedupe.matchTask(item, tasks, fb).taskId).toBe('101');
+  });
+
+  test('an undo without a time withdraws the next older not_duplicate row', () => {
+    const ctx = setup();
+    const fb = [{ type: 'undone', queueId: 'q_1', detail: { action: 'undup' } }, { type: 'not_duplicate', queueId: 'q_1', detail: { dupTaskId: '101' } }];
+    expect(ctx.Dedupe.matchTask(item, tasks, fb).taskId).toBe('101');
+  });
+
+  test('undoing a later toggle-off (no matching row) leaves the pair suppressed', () => {
+    const ctx = setup();
+    // set at 10:00, toggled off at 10:02 (writes nothing), toggle-off undone at 10:03.
+    const fb = [undo('2026-09-28T10:03:00Z', '2026-09-28T10:02:00Z'), nd('2026-09-28T10:00:00Z')];
+    expect(ctx.Dedupe.matchTask(item, tasks, fb)).toBeNull();
+  });
+
+  test('a newer not_duplicate after an undone one suppresses again (latest state wins)', () => {
+    const ctx = setup();
+    const fb = [nd('2026-09-28T11:00:00Z'), undo('2026-09-28T10:05:00Z', '2026-09-28T10:00:00Z'), nd('2026-09-28T10:00:00Z')];
+    expect(ctx.Dedupe.matchTask(item, tasks, fb)).toBeNull();
+  });
+
+  test('detail.cleared = true un-suppresses; order is by time even if rows arrive oldest first', () => {
+    const ctx = setup();
+    const cleared = nd('2026-09-28T10:10:00Z', { detail: { dupTaskId: '101', cleared: true } });
+    expect(ctx.Dedupe.matchTask(item, tasks, [nd('2026-09-28T10:00:00Z'), cleared]).taskId).toBe('101');
+    expect(ctx.Dedupe.matchTask(item, tasks, [cleared, nd('2026-09-28T10:20:00Z')])).toBeNull();
+  });
+
+  test('undo rows for another item or action are ignored; detail may be a JSON string', () => {
+    const ctx = setup();
+    const fb = [
+      { at: '2026-09-28T10:05:00Z', type: 'undone', queueId: 'q_other', title: 'x', detail: { action: 'undup', at: '2026-09-28T10:00:00Z' } },
+      { at: '2026-09-28T10:05:00Z', type: 'undone', queueId: 'q_1', detail: '{"action":"dismiss","at":"2026-09-28T10:00:00Z"}' },
+      nd('2026-09-28T10:00:00Z', { detail: '{"dupTaskId":"101"}' })
+    ];
+    expect(ctx.Dedupe.matchTask(item, tasks, fb)).toBeNull();
+  });
+});
+
+describe('Dedupe ownership', () => {
+  test('a transcript borrowed from another member carries that note\'s owner', () => {
+    const ctx = setup();
+    const primary = fireflies({ transcript: null });
+    const sharedNote = granola({ ownerIsMe: false, ownerName: 'Alex Blundell', ownerEmail: 'ablundell@insightsoftmax.com' });
+    const out = ctx.Dedupe.combine_([primary, sharedNote]);
+    expect(out.transcriptFrom).toBe('granola');
+    expect(out.transcriptOwnerIsMe).toBe(false);
+    expect(out.transcriptOwnerName).toBe('Alex Blundell');
+    expect(out.transcriptOwnerEmail).toBe('ablundell@insightsoftmax.com');
+  });
+
+  test('members without owner info add no owner fields', () => {
+    const ctx = setup();
+    const out = ctx.Dedupe.mergeMeetings([fireflies(), granola({ transcript: null })]);
+    expect(out[0].transcriptFrom).toBe('fireflies');
+    expect(out[0].transcriptOwnerIsMe).toBeUndefined();
   });
 });

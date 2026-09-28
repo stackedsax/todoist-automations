@@ -507,3 +507,132 @@ describe('Extract helpers', () => {
     expect(ctx.Extract.mmss_(3700)).toBe('1:01:40');
   });
 });
+
+describe('Extract ownership of shared Granola notes', () => {
+  // A note Alex Blundell shared with Alex Scammon. Granola.mapTranscript already maps the
+  // owner's mic to 'them'; the raw 'me' segment below exercises Extract's own guard too.
+  const shared = () => Object.assign(granolaMeeting(), {
+    key: 'granola:not_shared', sourceId: 'not_shared',
+    ownerIsMe: false, ownerName: 'Alex Blundell', ownerEmail: 'ablundell@insightsoftmax.com',
+    transcript: [
+      { speaker: 'me', name: null, text: 'I will send the AWS invoice to finance.', t: 30 },
+      { speaker: 'them', name: 'Alex Blundell', text: 'And I will book the room.', t: 40 },
+      { speaker: 'me', name: 'Alex Scammon', text: 'I will intro Marcus to Spectro.', t: 50 }
+    ]
+  });
+
+  test('Source line names the owner and says the microphone is NOT Alex', () => {
+    const ctx = setup();
+    ctx.Extract.meeting(shared(), { sectionsByProject: CATALOGUE, feedback: [] });
+    const user = ctx.Claude.json.mock.calls[0][0].user;
+    expect(user).toMatch(/Source: Granola \(shared note owned by Alex Blundell <ablundell@insightsoftmax\.com> \[NOT ALEX: different person\]; microphone = Alex Blundell, NOT Alex\)/);
+    expect(user).not.toMatch(/Alex's own note/);
+  });
+
+  test("owner's 'me' segments are labelled OTHER; a 'me' segment named as Alex Scammon stays ALEX", () => {
+    const ctx = setup();
+    ctx.Extract.meeting(shared(), { sectionsByProject: CATALOGUE, feedback: [] });
+    const user = ctx.Claude.json.mock.calls[0][0].user;
+    expect(user).toMatch(/\[00:30\] OTHER \(Alex Blundell, note owner, NOT Alex Scammon\): I will send the AWS invoice/);
+    expect(user).toMatch(/\[00:40\] OTHER \(Alex Blundell, NOT Alex Scammon\): And I will book/);
+    expect(user).toMatch(/\[00:50\] ALEX: I will intro Marcus/);
+    expect(user).not.toMatch(/ALEX: I will send the AWS invoice/);
+  });
+
+  test("system prompt no longer claims the microphone is always Alex's", () => {
+    const ctx = setup();
+    ctx.Extract.meeting(shared(), { sectionsByProject: CATALOGUE, feedback: [] });
+    const system = ctx.Claude.json.mock.calls[0][0].system;
+    expect(system).not.toMatch(/always the note owner, Alex/);
+    expect(system).toMatch(/microphone channel belongs to the NOTE OWNER/);
+  });
+
+  test("Alex's own note (ownerIsMe true, or no owner info) keeps microphone = Alex", () => {
+    const ctx = setup();
+    ctx.Extract.meeting(Object.assign(granolaMeeting(), { ownerIsMe: true, ownerEmail: 'alex@gr-oss.io' }), { sectionsByProject: CATALOGUE, feedback: [] });
+    ctx.Extract.meeting(granolaMeeting(), { sectionsByProject: CATALOGUE, feedback: [] });
+    ctx.Claude.json.mock.calls.forEach(c => {
+      expect(c[0].user).toMatch(/Source: Granola \(Alex's own note; microphone = Alex\)/);
+      expect(c[0].user).toMatch(/\[00:12\] ALEX: I will send the build notes/);
+    });
+  });
+
+  test('owner inferred from ownerEmail when ownerIsMe is absent', () => {
+    const ctx = setup();
+    expect(ctx.Extract.noteOwner_({ ownerEmail: 'ablundell@insightsoftmax.com' }).isMe).toBe(false);
+    expect(ctx.Extract.noteOwner_({ ownerEmail: 'alex@insightsoftmax.com' }).isMe).toBe(true);
+    expect(ctx.Extract.noteOwner_({}).isMe).toBe(true);
+  });
+
+  test('transcript borrowed from a shared Granola note in a merged Fireflies meeting is owner-labelled', () => {
+    const ctx = setup();
+    const m = Object.assign(firefliesMeeting(), {
+      transcript: [{ speaker: 'me', name: null, text: 'I will send the AWS invoice.', t: 5 }],
+      transcriptFrom: 'granola', transcriptOwnerIsMe: false, transcriptOwnerName: 'Alex Blundell'
+    });
+    ctx.Extract.meeting(m, { sectionsByProject: CATALOGUE, feedback: [] });
+    const user = ctx.Claude.json.mock.calls[0][0].user;
+    expect(user).toMatch(/Transcript taken from a Granola note \(shared note owned by Alex Blundell/);
+    expect(user).toMatch(/\[00:05\] OTHER \(Alex Blundell, note owner, NOT Alex Scammon\)/);
+  });
+});
+
+describe('Extract title clean-up', () => {
+  function run(items) {
+    const ctx = setup();
+    ctx.Claude.json.mockReturnValue({ items });
+    return ctx.Extract.meeting(granolaMeeting(), { sectionsByProject: CATALOGUE, feedback: [] });
+  }
+
+  test('titles starting with a number keep it; only list markers are stripped', () => {
+    const out = run([
+      item({ title: '3D print the enclosure' }),
+      item({ title: '2026 roadmap: send to Marcus' }),
+      item({ title: '1. Book the venue' }),
+      item({ title: '12) Renew the domain' }),
+      item({ title: '- * Update the wiki' }),
+      item({ title: '•Order cables' })
+    ]);
+    expect(out.map(i => i.title)).toEqual([
+      '3D print the enclosure', '2026 roadmap: send to Marcus', 'Book the venue', 'Renew the domain', 'Update the wiki', 'Order cables'
+    ]);
+  });
+
+  test('"I will" and "Alex Scammon will" are stripped silently, keeping confidence', () => {
+    const out = run([
+      item({ title: 'I will send the deck to Jon' }),
+      item({ title: 'Alex Scammon to book flights to KubeCon' }),
+      item({ title: 'Alexander should renew the SSL cert' })
+    ]);
+    expect(out.map(i => [i.title, i.confidence])).toEqual([
+      ['Send the deck to Jon', 'high'], ['Book flights to KubeCon', 'high'], ['Renew the SSL cert', 'high']
+    ]);
+  });
+
+  test('a bare "Alex will…" title is capped at low confidence and flagged in why', () => {
+    const out = run([item({ title: 'Alex will send the deck to Jon', why: 'Assigned in the meeting.' })]);
+    expect(out).toHaveLength(1);
+    expect(out[0].title).toBe('Send the deck to Jon');
+    expect(out[0].confidence).toBe('low');
+    expect(out[0].why).toBe('Ambiguous "Alex" (may not be Alex Scammon). Assigned in the meeting.');
+  });
+
+  test('"Alex Blundell will…" is still dropped', () => {
+    expect(run([item({ title: 'Alex Blundell will send the invoice' })])).toEqual([]);
+  });
+});
+
+describe('Extract.resolution evidence links', () => {
+  test('resolved high citing evidence without a link is downgraded to med', () => {
+    const ctx = setup();
+    ctx.Claude.json.mockReturnValue({ resolved: true, confidence: 'high', reason: 'Said so in the meeting.', evidenceRef: 'E1' });
+    const r = ctx.Extract.resolution({ title: 'Get the branch from Mihailo' }, [{ source: 'granola', text: 'Mihailo: I pushed the branch.' }]);
+    expect(r).toEqual({ resolved: true, confidence: 'med', reason: 'Said so in the meeting.', evidenceLink: null });
+  });
+
+  test('not-resolved and med results are left alone', () => {
+    const ctx = setup();
+    ctx.Claude.json.mockReturnValue({ resolved: true, confidence: 'med', reason: 'Probably.', evidenceRef: 'E1' });
+    expect(ctx.Extract.resolution({ title: 'x' }, [{ source: 'slack', text: 'done' }]).confidence).toBe('med');
+  });
+});

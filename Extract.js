@@ -181,8 +181,9 @@ const Extract = {
     const hit = raw.evidenceRef && refs[String(raw.evidenceRef).replace(/[[\]\s]/g, '')];
     const resolved = raw.resolved === true;
     let confidence = conf;
-    // Auto-close needs a pointer to the proof: without a valid evidence ref, never high.
-    if (resolved && !hit && confidence === 'high') confidence = 'med';
+    // Auto-close needs a link to the proof: without a valid evidence ref that carries a link,
+    // never high (Waiting only auto-closes on high, and its closing comment cites the link).
+    if (resolved && (!hit || !hit.link) && confidence === 'high') confidence = 'med';
     return {
       resolved: resolved,
       confidence: confidence,
@@ -248,7 +249,8 @@ const Extract = {
     if (source === 'meeting') {
       L.push('');
       L.push('MEETING RULES');
-      L.push('- Transcript lines labelled ALEX are Alex Scammon (the Granola microphone channel is always the note owner, Alex). Lines labelled OTHER are other people, never Alex, whatever the name.');
+      L.push('- Transcript lines labelled ALEX are Alex Scammon. Lines labelled OTHER are other people, never Alex, whatever the name.');
+      L.push('- The Granola microphone channel belongs to the NOTE OWNER. In Alex\'s own note that is Alex; in a note someone else shared with Alex, it is that person (labelled OTHER), never Alex. The Source line says whose note it is.');
       L.push('- The AI-generated summary can misattribute ownership (it may say "Alex" meaning Alex Blundell). When a transcript is present, verify ownership there.');
       L.push('- Fireflies action items are grouped by speaker names that are UNRELIABLE: treat them as hints only and never as proof that an item is Alex Scammon\'s.');
       L.push('- timestampSec: seconds from the [mm:ss] mark of the supporting transcript line, else null.');
@@ -315,10 +317,45 @@ const Extract = {
     return out;
   },
 
+  /** Leading list markers: "- ", "* ", "• " (or a bare "•"), "1. ", "12) ". */
+  LIST_MARKER_RE_: /^(?:[-*•]\s+|•|\d{1,2}[.)]\s+)+/,
+
+  /** "<subject> will|to|should|needs to|must " after a self-reference. */
+  SELF_VERB_RE_: '\\s+(?:will|to|should|needs to|need to|must)\\s+',
+
+  /**
+   * Strips a leading self-reference from a todo title. "I will…" and any identity.myNames
+   * entry ("Alex Scammon will…") are removed silently; a bare "Alex will…" is removed too but
+   * reported as ambiguous so the caller can cap confidence (it may be Alex Blundell).
+   * @return {{title: string, ambiguous: string|null}}
+   */
+  stripSelfLead_(title) {
+    const t = String(title || '');
+    const verb = Extract.SELF_VERB_RE_;
+    const esc = function (x) { return String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); };
+    const full = (Config.identity().myNames || [])
+      .filter(function (n) { return n && String(n).trim(); })
+      .sort(function (a, b) { return b.length - a.length; });
+    for (let i = 0; i < full.length; i++) {
+      const re = new RegExp('^' + esc(String(full[i]).trim()).replace(/\s+/g, '\\s+') + verb, 'i');
+      if (re.test(t)) return { title: t.replace(re, ''), ambiguous: null };
+    }
+    if (/^i\s+(?:will|should|need to|must)\s+/i.test(t)) {
+      return { title: t.replace(/^i\s+(?:will|should|need to|must)\s+/i, ''), ambiguous: null };
+    }
+    const bare = new RegExp('^(alex)' + verb, 'i');
+    const m = t.match(bare);
+    if (m) return { title: t.replace(bare, ''), ambiguous: m[1] };
+    return { title: t, ambiguous: null };
+  },
+
   normalizeItem_(r, c, catalogue) {
     if (!r || typeof r !== 'object') return null;
-    let title = Extract.clean_(r.title).replace(/^[-*•\d.)\s]+/, '').replace(/[.;:,\s]+$/, '');
-    title = title.replace(/^(alex( scammon)?|i)\s+(will|to|should|needs to|must)\s+/i, '');
+    // Strip list markers only ("- ", "* ", "• ", "1. ", "2) "): titles like "3D print…" or
+    // "2026 roadmap…" keep their leading number.
+    let title = Extract.clean_(r.title).replace(Extract.LIST_MARKER_RE_, '').replace(/[.;:,\s]+$/, '');
+    const lead = Extract.stripSelfLead_(title);
+    title = lead.title;
     if (!title) return null;
     title = title.charAt(0).toUpperCase() + title.slice(1);
     title = Util.truncate(title, Extract.MAX_TITLE);
@@ -356,6 +393,12 @@ const Extract = {
 
     let confidence = Extract.CONFIDENCE.indexOf(r.confidence) >= 0 ? r.confidence : 'low';
     if (kind === 'waiting' && !ownerName && !ownerEmail) confidence = 'low';
+    // A bare "Alex will…" may be Alex Blundell: never let it through as a clean todo.
+    let why = Extract.clean_(r.why);
+    if (lead.ambiguous) {
+      confidence = 'low';
+      why = 'Ambiguous "' + lead.ambiguous + '" (may not be Alex Scammon). ' + why;
+    }
 
     const project = Route.normalizeKey(r.project);
     const section = project ? Route.section(project, r.section, catalogue) : null;
@@ -367,7 +410,7 @@ const Extract = {
       ownerName: ownerName,
       ownerEmail: ownerEmail,
       quote: quote,
-      why: Util.truncate(Extract.clean_(r.why), Extract.MAX_WHY),
+      why: Util.truncate(why.trim(), Extract.MAX_WHY),
       due: Extract.isoOrNull_(r.due),
       resurface: kind === 'waiting' ? Extract.isoOrNull_(r.resurface) : null,
       confidence: confidence,
@@ -397,7 +440,7 @@ const Extract = {
     const start = Util.parseDate(m.start);
     if (start) L.push('Date: ' + Util.formatDate(start, 'EEE d MMM yyyy HH:mm') + ' (' + Util.isoDate(start) + ')');
     L.push('Today: ' + (o.today || Util.today()));
-    L.push('Source: ' + srcName + (m.source === 'fireflies' ? ' (recorder bot; speaker names come from Fireflies)' : ' (Alex\'s own note; microphone = Alex)') +
+    L.push('Source: ' + srcName + (m.source === 'fireflies' ? ' (recorder bot; speaker names come from Fireflies)' : Extract.granolaOwnerNote_(Extract.noteOwner_(m))) +
       ((m.alsoRecordedBy || []).length ? '; also recorded by ' + m.alsoRecordedBy.map(function (a) { return a.source; }).join(', ') : ''));
     const att = (m.attendees || []).slice(0, 40);
     if (att.length) {
@@ -421,7 +464,12 @@ const Extract = {
     L.push('');
     if (m.transcript && m.transcript.length) {
       L.push('TRANSCRIPT (ALEX = Alex Scammon; OTHER = someone else)');
-      L.push(Extract.transcriptText_(m.transcript, m.transcriptFrom || m.source));
+      const tsrc = m.transcriptFrom || m.source;
+      const towner = Extract.transcriptOwner_(m);
+      if (tsrc === 'granola' && m.transcriptFrom && m.transcriptFrom !== m.source) {
+        L.push('(Transcript taken from a Granola note' + Extract.granolaOwnerNote_(towner) + ')');
+      }
+      L.push(Extract.transcriptText_(m.transcript, tsrc, towner));
     } else {
       L.push('TRANSCRIPT: not available. Be conservative about ownership: use high confidence only when the summary names Alex Scammon unambiguously.');
     }
@@ -548,8 +596,8 @@ const Extract = {
   },
 
   /** Transcript lines labelled ALEX / OTHER, middle elided when over budget. */
-  transcriptText_(transcript, source) {
-    const lines = transcript.map(function (seg) { return Extract.segmentLine_(seg, source); }).filter(Boolean);
+  transcriptText_(transcript, source, owner) {
+    const lines = transcript.map(function (seg) { return Extract.segmentLine_(seg, source, owner); }).filter(Boolean);
     const total = lines.reduce(function (n, l) { return n + l.length + 1; }, 0);
     if (total <= Extract.TRANSCRIPT_CHARS) return lines.join('\n');
     // Keep the opening and (larger) closing parts: commitments cluster at the end of meetings.
@@ -566,26 +614,65 @@ const Extract = {
     return head.concat(['[… ' + (j - i + 1) + ' transcript lines omitted …]'], tail).join('\n');
   },
 
-  segmentLine_(seg, source) {
+  segmentLine_(seg, source, owner) {
     if (!seg || !seg.text) return '';
     const text = Extract.clean_(seg.text);
     if (!text) return '';
     const t = typeof seg.t === 'number' && isFinite(seg.t) ? '[' + Extract.mmss_(seg.t) + '] ' : '';
-    return t + Extract.speakerLabel_(seg, source) + ': ' + text;
+    return t + Extract.speakerLabel_(seg, source, owner) + ': ' + text;
   },
 
   /**
-   * Speaker label. Granola 'me' (microphone) = ALEX; Granola 'them' = OTHER.
+   * Speaker label. 'me' = ALEX, except in a Granola note someone else owns: there 'me' is only
+   * trusted when the segment is named as one of myNames (Granola.mapTranscript already maps the
+   * owner's microphone to 'them'; this is a second guard). 'them' = OTHER.
    * Named speakers (Fireflies): ALEX only if the name is one of myNames; notMe is flagged loudly;
    * a bare first name "Alex" is flagged as ambiguous.
+   * @param {{isMe: boolean, name: string|null, email: string|null}} [owner] note owner (Granola)
    */
-  speakerLabel_(seg, source) {
+  speakerLabel_(seg, source, owner) {
     const name = seg.name ? Extract.clean_(seg.name) : '';
+    const shared = source === 'granola' && owner && owner.isMe === false;
+    if (seg.speaker === 'me' && shared && !Config.isMyName(name)) {
+      const who = name || Extract.clean_(owner.name || '') || owner.email || 'the note owner';
+      return 'OTHER (' + who + ', note owner, NOT Alex Scammon)';
+    }
     if (seg.speaker === 'me') return 'ALEX';
     if (Config.isNotMe(name)) return 'OTHER (' + name + ', NOT Alex Scammon)';
     if (seg.speaker !== 'them' && Config.isMyName(name)) return 'ALEX';
     if (name && /^alex(ander)?$/i.test(name)) return 'OTHER? (' + name + ': ambiguous, may be ' + (Config.identity().notMe[0] || 'someone else') + ')';
     return 'OTHER' + (name && !Config.isMyName(name) ? ' (' + name + ')' : '');
+  },
+
+  /**
+   * Owner of a Granola note: {isMe, name, email}. Meetings from Granola.toMeeting carry
+   * ownerIsMe/ownerName/ownerEmail; a note without them is treated as Alex's (as Granola.owner_).
+   */
+  noteOwner_(m) {
+    const x = m || {};
+    const email = Util.parseEmail(x.ownerEmail) || null;
+    const name = x.ownerName ? Extract.clean_(x.ownerName) || null : null;
+    let isMe;
+    if (x.ownerIsMe === true || x.ownerIsMe === false) isMe = x.ownerIsMe;
+    else if (email) isMe = Config.isMyEmail(email);
+    else if (name) isMe = Config.isMyName(name);
+    else isMe = true;
+    return { isMe: isMe, name: name, email: email };
+  },
+
+  /** Owner of the note the transcript came from (Dedupe.merge may borrow another member's). */
+  transcriptOwner_(m) {
+    const x = m || {};
+    if (x.transcriptFrom && x.transcriptFrom !== x.source) {
+      return Extract.noteOwner_({ ownerIsMe: x.transcriptOwnerIsMe, ownerName: x.transcriptOwnerName, ownerEmail: x.transcriptOwnerEmail });
+    }
+    return Extract.noteOwner_(x);
+  },
+
+  granolaOwnerNote_(owner) {
+    if (!owner || owner.isMe !== false) return ' (Alex\'s own note; microphone = Alex)';
+    const who = Extract.personLabel_(owner.name, owner.email) || 'someone else';
+    return ' (shared note owned by ' + who + '; microphone = ' + (owner.name || owner.email || 'the owner') + ', NOT Alex)';
   },
 
   mmss_(sec) {

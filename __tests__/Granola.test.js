@@ -211,13 +211,104 @@ describe('Granola.mapTranscript speaker attribution', () => {
       { text: 'no speaker object' }
     ]);
     expect(out.map(s => [s.speaker, s.t])).toEqual([
-      ['me', 0], ['them', 5], ['them', 12], ['me', null], ['unknown', null], ['unknown', null], ['unknown', null]
+      // dual-stream transcript: a generic name or no name falls back to source ("speaker" -> them)
+      ['me', 0], ['them', 5], ['them', 12], ['me', null], ['them', null], ['them', null], ['unknown', null]
     ]);
+  });
+
+  test('source is a fallback only in dual-stream transcripts (macOS); iOS single mic stays unknown', () => {
+    const ctx = load();
+    const mac = ctx.Granola.mapTranscript([
+      { speaker: { source: 'microphone' }, text: 'my mic' },
+      { speaker: { source: 'speaker' }, text: 'system audio' }
+    ]);
+    expect(mac.map(s => s.speaker)).toEqual(['me', 'them']);
+    const ios = ctx.Granola.mapTranscript([
+      { speaker: { source: 'microphone', diarization_label: 'Speaker A' }, text: 'a' },
+      { speaker: { source: 'microphone', diarization_label: 'Speaker B' }, text: 'b' },
+      { speaker: { source: 'microphone' }, text: 'c' }
+    ]);
+    expect(ios.map(s => s.speaker)).toEqual(['unknown', 'unknown', 'unknown']);
+  });
+
+  test('generic "Speaker A" names are unknown; a bare "Alex" is unknown, not them', () => {
+    const ctx = load();
+    const out = ctx.Granola.mapTranscript([
+      { speaker: { source: 'microphone', name: 'Speaker A' }, text: 'a' },
+      { speaker: { source: 'microphone', name: 'speaker b' }, text: 'b' },
+      { speaker: { source: 'microphone', name: 'Alex' }, text: 'c' },
+      { speaker: { source: 'microphone', name: 'Alexander' }, text: 'd' },
+      { speaker: { source: 'microphone', name: 'Alex Blundell' }, text: 'e' },
+      { speaker: { source: 'microphone', name: 'Speakers Corner Ltd' }, text: 'f' }
+    ]);
+    expect(out.map(s => s.speaker)).toEqual(['unknown', 'unknown', 'unknown', 'me', 'them', 'them']);
   });
 
   test('IDENTITY override adds names', () => {
     const ctx = load({ IDENTITY: JSON.stringify({ myNames: ['Scammon'] }) });
     expect(ctx.Granola.mapTranscript([{ speaker: { name: 'Scammon' }, text: 'x' }])[0].speaker).toBe('me');
+  });
+});
+
+describe('Granola note ownership', () => {
+  // A note Alex Blundell recorded and shared with Alex: "me" is Blundell's mic, not Alex's.
+  const sharedNote = () => Object.assign(syncNote(), {
+    id: 'not_blundell0925',
+    title: 'ISC Delivery Sync (shared)',
+    owner: { name: 'Alex Blundell', email: 'ablundell@insightsoftmax.com' },
+    transcript: [
+      { speaker: { source: 'microphone', attribution: 'me' }, text: 'I will send the SOW.', start_time: 0 },
+      { speaker: { source: 'speaker', attribution: 'them' }, text: 'Unattributed remote voice.', start_time: 10 },
+      { speaker: { source: 'speaker', attribution: 'them', name: 'Alex Scammon' }, text: 'I will intro Marcus.', start_time: 20 },
+      { speaker: { source: 'microphone' }, text: 'Owner mic, no attribution.', start_time: 30 },
+      { speaker: { source: 'speaker' }, text: 'Remote, no attribution.', start_time: 40 }
+    ]
+  });
+
+  test('attribution "me" in someone else\'s note is the owner, never Alex', () => {
+    const ctx = load();
+    const m = ctx.Granola.toMeeting(sharedNote());
+    expect(m.ownerEmail).toBe('ablundell@insightsoftmax.com');
+    expect(m.ownerName).toBe('Alex Blundell');
+    expect(m.ownerIsMe).toBe(false);
+    expect(m.transcript.map(s => [s.speaker, s.name])).toEqual([
+      ['them', 'Alex Blundell'],
+      ['unknown', null],
+      ['me', 'Alex Scammon'],
+      ['them', 'Alex Blundell'],
+      ['unknown', null]
+    ]);
+    expect(m.transcript.filter(s => s.speaker === 'me').map(s => s.text)).toEqual(['I will intro Marcus.']);
+  });
+
+  test('Alex\'s own notes (any of his emails) keep attribution; missing owner means Alex', () => {
+    const ctx = load();
+    const own = ctx.Granola.toMeeting(syncNote());
+    expect(own).toMatchObject({ ownerEmail: 'alex@gr-oss.io', ownerIsMe: true });
+    expect(own.transcript[0].speaker).toBe('me');
+    const n = syncNote();
+    n.owner = { name: 'Alex Scammon', email: 'ALEX@InsightSoftmax.com' };
+    expect(ctx.Granola.toMeeting(n).ownerIsMe).toBe(true);
+    delete n.owner;
+    const noOwner = ctx.Granola.toMeeting(n);
+    expect(noOwner).toMatchObject({ ownerEmail: null, ownerIsMe: true });
+    expect(noOwner.transcript[0].speaker).toBe('me');
+  });
+
+  test('owner without email: judged by name; a bare "Alex" or notMe name is not Alex', () => {
+    const ctx = load();
+    const mk = (owner) => ctx.Granola.toMeeting(Object.assign(syncNote(), { owner }));
+    expect(mk({ name: 'Alex Scammon' }).ownerIsMe).toBe(true);
+    expect(mk({ name: 'Alex' }).ownerIsMe).toBe(false);
+    expect(mk({ name: 'Alex Blundell' }).ownerIsMe).toBe(false);
+    expect(mk({ name: 'Alex Blundell' }).transcript[0].speaker).toBe('them');
+  });
+
+  test('IDENTITY myEmails override counts as Alex', () => {
+    const ctx = load({ IDENTITY: JSON.stringify({ myEmails: ['alex@newco.example'] }) });
+    const n = sharedNote();
+    n.owner = { name: 'Alex Scammon', email: 'alex@newco.example' };
+    expect(ctx.Granola.toMeeting(n).transcript[0].speaker).toBe('me');
   });
 });
 

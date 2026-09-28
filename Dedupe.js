@@ -69,7 +69,7 @@ const Dedupe = {
    * Pairs recorded as `not_duplicate` feedback are skipped, as is item.dupTaskId when item.notDuplicate.
    * @param {{id?: string, title: string, dupTaskId?: string, notDuplicate?: boolean}} item
    * @param {Object[]} openTasks Todoist tasks ({id, content})
-   * @param {Object[]} [feedback] Store.feedbackRecent() rows (any type; only not_duplicate is used)
+   * @param {Object[]} [feedback] Store.feedbackRecent() rows (any type; not_duplicate rows and 'undone' undup reversals are used)
    * @return {{taskId: string, title: string, score: number, jaccard: number, containment: number}|null}
    */
   matchTask(item, openTasks, feedback) {
@@ -116,10 +116,16 @@ const Dedupe = {
       .trim();
   },
 
-  /** not_duplicate feedback (newest first) for callers that don't already hold it. */
+  /**
+   * Feedback matchTask needs, newest first: not_duplicate rows plus the 'undone' rows that
+   * withdraw an undup (so a reversed "not a duplicate" stops suppressing the pair).
+   */
   notDuplicateFeedback(n) {
+    const lim = n || 200;
     try {
-      return Store.feedbackRecent(n || 200, 'not_duplicate');
+      return (Store.feedbackRecent(lim * 5) || []).filter(function (f) {
+        return f && (f.type === 'not_duplicate' || (f.type === 'undone' && Dedupe.detail_(f).action === 'undup'));
+      }).slice(0, lim);
     } catch (e) {
       console.log('Dedupe.notDuplicateFeedback: ' + e.message);
       return [];
@@ -183,6 +189,10 @@ const Dedupe = {
       if ((!primary.transcript || !primary.transcript.length) && m.transcript && m.transcript.length) {
         primary.transcript = m.transcript;
         primary.transcriptFrom = m.source;
+        // Whose note the borrowed transcript is (Granola: the microphone belongs to its owner).
+        if (m.ownerIsMe !== undefined) primary.transcriptOwnerIsMe = m.ownerIsMe;
+        if (m.ownerName !== undefined) primary.transcriptOwnerName = m.ownerName;
+        if (m.ownerEmail !== undefined) primary.transcriptOwnerEmail = m.ownerEmail;
       }
       if (!primary.actionItemsText && m.actionItemsText) primary.actionItemsText = m.actionItemsText;
       if (!primary.summaryMarkdown && m.summaryMarkdown) primary.summaryMarkdown = m.summaryMarkdown;
@@ -195,22 +205,76 @@ const Dedupe = {
     return primary;
   },
 
+  /** An undo row is paired with the not_duplicate row its undup wrote when their times agree. */
+  UNDO_PAIR_MS_: 5000,
+
+  /**
+   * Task ids / titles this item must not be matched against. Feedback is replayed newest-first
+   * so the latest state per (item, task) wins:
+   *   - type 'not_duplicate'                       -> pair suppressed
+   *   - type 'not_duplicate' with detail.cleared   -> pair un-suppressed (toggle-off contract)
+   *   - type 'undone' with detail.action 'undup'   -> withdraws the not_duplicate row written by
+   *     that undup (matched by detail.at within UNDO_PAIR_MS_, or the next older row when the
+   *     undo carries no time); an undo of a toggle-off matches nothing and changes nothing.
+   * Other rows are ignored, so callers may pass mixed feedback (see notDuplicateFeedback).
+   */
   blockedTaskIds_(item, feedback) {
     const ids = {};
     const titles = {};
     if (item.notDuplicate && item.dupTaskId) ids[String(item.dupTaskId)] = 1;
     const myTitle = Util.normalizeTitle(item.title);
-    (feedback || []).forEach(function (f) {
-      if (!f || f.type !== 'not_duplicate') return;
+    const rows = [];
+    (feedback || []).forEach(function (f, i) {
+      if (!f) return;
+      const isUndo = f.type === 'undone' && Dedupe.detail_(f).action === 'undup';
+      if (f.type !== 'not_duplicate' && !isUndo) return;
       const sameItem = (item.id && f.queueId && f.queueId === item.id) ||
         (f.title && Util.normalizeTitle(f.title) === myTitle);
       if (!sameItem) return;
-      const d = (f.detail && typeof f.detail === 'object') ? f.detail : {};
+      rows.push({ f: f, i: i, undo: isUndo, ms: Dedupe.ms_(f.at) });
+    });
+    // Newest first; rows without a time keep the caller's order (feedbackRecent is newest first).
+    rows.sort(function (a, b) {
+      if (!isNaN(a.ms) && !isNaN(b.ms) && a.ms !== b.ms) return b.ms - a.ms;
+      return a.i - b.i;
+    });
+    const decided = {};
+    const undos = [];
+    rows.forEach(function (r) {
+      const d = Dedupe.detail_(r.f);
+      if (r.undo) {
+        undos.push({ ms: Dedupe.ms_(d.at), used: false });
+        return;
+      }
       const tid = d.taskId || d.dupTaskId;
-      if (tid) ids[String(tid)] = 1;
       const tt = d.taskTitle || d.dupTaskTitle;
+      // State is keyed by task id when known (the title rides along), else by task title.
+      const key = tid ? 'id:' + String(tid) : (tt ? 't:' + Util.normalizeTitle(Dedupe.taskText(tt)) : null);
+      if (!key) return;
+      let blocked = d.cleared !== true;
+      if (blocked) {
+        const u = undos.find(function (x) {
+          return !x.used && (isNaN(x.ms) || isNaN(r.ms) || Math.abs(x.ms - r.ms) <= Dedupe.UNDO_PAIR_MS_);
+        });
+        if (u) { u.used = true; blocked = false; }
+      }
+      if (decided[key] !== undefined) return;
+      decided[key] = blocked;
+      if (!blocked) return;
+      if (tid) ids[String(tid)] = 1;
       if (tt) titles[Util.normalizeTitle(Dedupe.taskText(tt))] = 1;
     });
     return { ids: ids, titles: titles };
+  },
+
+  detail_(f) {
+    let d = f && f.detail;
+    if (typeof d === 'string') d = Util.parseJson(d, {});
+    return d && typeof d === 'object' ? d : {};
+  },
+
+  ms_(v) {
+    const d = v ? Util.parseDate(v) : null;
+    return d ? d.getTime() : NaN;
   }
 };

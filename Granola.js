@@ -16,9 +16,26 @@
  * Only notes that have a generated summary are returned by the API; notes still waiting for
  * a summary are caught by Checks (runSummaryCheck), not here.
  *
- * Transcript speaker mapping: speaker.attribution "me" -> "me", "them" -> "them"; when the
- * attribution is missing, a speaker name in identity.myNames -> "me", any other real name
- * (including identity.notMe, e.g. "Alex Blundell") -> "them", otherwise "unknown".
+ * Note ownership: with the Personal notes scope the API also returns notes shared with Alex
+ * (owned by someone else) -- https://docs.granola.ai/ ("Notes you own", "Notes directly shared
+ * with you", "Notes in private folders shared with you"). Note/NoteSummary carry
+ * `owner {name, email}` (https://docs.granola.ai/api-reference/get-note.md). In a note someone
+ * else owns, attribution "me" / source "microphone" describe THE OWNER's mic, not Alex's.
+ * Meetings therefore carry `ownerEmail` and `ownerIsMe` (extras beyond the DESIGN shape).
+ * A note with no owner at all is treated as Alex's; see owner_().
+ *
+ * Transcript speaker mapping (first rule that applies):
+ *   1. speaker.attribution: in Alex's note "me" -> "me", "them" -> "them". In someone else's
+ *      note "me" -> "them" (the owner; name defaults to the owner's name) and "them" -> only
+ *      decided by the name (it could be Alex), else "unknown".
+ *   2. speaker.name (diarization_label and generic "Speaker 2" / "Speaker A" are ignored):
+ *      identity.notMe (e.g. "Alex Blundell") -> "them"; identity.myNames -> "me"; a bare first
+ *      name shared with Alex (e.g. just "Alex") -> "unknown"; any other real name -> "them".
+ *   3. speaker.source, only in Alex's own note and only when the transcript is dual-stream
+ *      (some segment has source "speaker", as on macOS): "microphone" -> "me",
+ *      "speaker" -> "them". iOS transcripts are a single "microphone" stream with
+ *      diarization labels, so the source says nothing there.
+ *   4. otherwise "unknown".
  */
 const Granola = {
   BASE: 'https://public-api.granola.ai/v1',
@@ -135,6 +152,7 @@ const Granola = {
     const start = Util.parseDate(ev.scheduled_start_time) || Util.parseDate(raw.created_at) || Util.now();
     const end = Util.parseDate(ev.scheduled_end_time);
     const title = String(raw.title || ev.event_title || 'Untitled meeting').trim();
+    const owner = Granola.owner_(raw);
     return {
       key: 'granola:' + raw.id,
       source: 'granola',
@@ -148,16 +166,44 @@ const Granola = {
       calendarEventId: ev.calendar_event_id || null,
       summaryMarkdown: String(raw.summary_markdown || raw.summary_text || ''),
       actionItemsText: null,
-      transcript: Array.isArray(raw.transcript) ? Granola.mapTranscript(raw.transcript) : null,
+      transcript: Array.isArray(raw.transcript) ? Granola.mapTranscript(raw.transcript, owner) : null,
       alsoRecordedBy: [],
-      // Extra (not in the DESIGN Meeting shape): lets Meetings advance granola.updatedAfter.
-      updatedAt: Util.parseDate(raw.updated_at)
+      // Extras (not in the DESIGN Meeting shape): updatedAt lets Meetings advance
+      // granola.updatedAfter; ownerEmail/ownerIsMe let Meetings/Dedupe prefer Alex's own notes.
+      updatedAt: Util.parseDate(raw.updated_at),
+      ownerEmail: owner.email,
+      ownerName: owner.name,
+      ownerIsMe: owner.isMe
     };
   },
 
-  /** Raw transcript segments -> [{speaker: me|them|unknown, name, text, t}] (empty text dropped). */
-  mapTranscript(segments) {
+  /**
+   * Note owner -> {name, email, isMe}. isMe: the owner email is in identity.myEmails; with no
+   * owner email, the owner name is in identity.myNames (a bare "Alex" is NOT enough); a note
+   * with no owner info at all is assumed to be Alex's (the API key is his).
+   */
+  owner_(raw) {
+    const o = raw && raw.owner;
+    const email = Granola.email_(o);
+    const name = o && typeof o === 'object' && o.name ? String(o.name).trim() || null : null;
+    let isMe;
+    if (email) isMe = Config.isMyEmail(email);
+    else if (name) isMe = Config.isMyName(name);
+    else isMe = true;
+    return { name: name, email: email, isMe: isMe };
+  },
+
+  /**
+   * Raw transcript segments -> [{speaker: me|them|unknown, name, text, t}] (empty text dropped).
+   * @param {Object[]} segments
+   * @param {{isMe?: boolean, name?: string}} [owner] the note owner (default: Alex)
+   */
+  mapTranscript(segments, owner) {
+    const own = { isMe: !owner || owner.isMe !== false, name: owner && owner.name ? owner.name : null };
     const list = (segments || []).filter(function (s) { return s && String(s.text || '').trim(); });
+    const dualStream = list.some(function (s) {
+      return s.speaker && String(s.speaker.source || '').toLowerCase() === 'speaker';
+    });
     let base = null;
     list.forEach(function (s) {
       const d = typeof s.start_time === 'number' ? null : Util.parseDate(s.start_time);
@@ -165,9 +211,15 @@ const Granola = {
     });
     return list.map(function (s) {
       const sp = s.speaker || {};
-      const name = sp.name ? String(sp.name).trim() || null : null;
+      let name = sp.name ? String(sp.name).trim() || null : null;
+      const speaker = Granola.speakerOf_(sp, own, dualStream);
+      if (!name && !own.isMe && own.name && speaker === 'them' &&
+        (String(sp.attribution || '').toLowerCase() === 'me' ||
+          (!sp.attribution && String(sp.source || '').toLowerCase() === 'microphone' && dualStream))) {
+        name = own.name;
+      }
       return {
-        speaker: Granola.speakerOf_(sp),
+        speaker: speaker,
         name: name,
         text: String(s.text).trim(),
         t: Granola.seconds_(s.start_time, base)
@@ -175,14 +227,40 @@ const Granola = {
     });
   },
 
-  speakerOf_(sp) {
+  /** See the header for the rules. `own` = {isMe, name}; dualStream = transcript has source "speaker". */
+  speakerOf_(sp, own, dualStream) {
+    const mine = !own || own.isMe !== false;
     const a = String(sp.attribution || '').toLowerCase();
-    if (a === 'me') return 'me';
-    if (a === 'them') return 'them';
-    const name = sp.name ? String(sp.name).trim() : '';
-    if (!name || /^speaker\s*\d*$/i.test(name)) return 'unknown';
+    const src = String(sp.source || '').toLowerCase();
+    if (mine && a === 'me') return 'me';
+    if (mine && a === 'them') return 'them';
+    if (!mine && a === 'me') return 'them'; // the owner's own mic
+    if (!mine && !a && src === 'microphone' && dualStream) return 'them';
+    const byName = Granola.speakerByName_(sp.name);
+    if (byName) return byName;
+    if (mine && !a && dualStream) {
+      if (src === 'microphone') return 'me';
+      if (src === 'speaker') return 'them';
+    }
+    return 'unknown';
+  },
+
+  /** me|them|unknown from a speaker name, or null when the name is missing or generic. */
+  speakerByName_(raw) {
+    const name = raw ? String(raw).trim() : '';
+    if (!name || /^speaker(\s*[a-z0-9]+)?$/i.test(name)) return null;
+    if (Config.isNotMe(name)) return 'them';
     if (Config.isMyName(name)) return 'me';
-    return 'them';
+    return Granola.sharesMyFirstName_(name) ? 'unknown' : 'them';
+  },
+
+  /** True for a bare first name shared with Alex (e.g. "Alex"), which could be anyone called Alex. */
+  sharesMyFirstName_(name) {
+    const n = String(name || '').trim().toLowerCase();
+    if (!n || /\s/.test(n)) return false;
+    return Config.identity().myNames.some(function (m) {
+      return String(m).trim().split(/\s+/)[0].toLowerCase() === n;
+    });
   },
 
   /** start_time -> whole seconds from the first segment (numbers are taken as seconds). */

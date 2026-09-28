@@ -92,8 +92,26 @@ function makeFakes(state) {
       return m ? Object.assign({}, m) : null;
     })
   };
+  // Mirrors the real Fireflies.listSince contract: oldest first; once the deadline has expired the
+  // remaining recordings come back unfetched with deferred: true; state.ffOnFetch(m) runs per fetch
+  // (tests use it to burn the budget); state.ffListCut throws FirefliesIncompleteError.
   const Fireflies = {
-    listSince: jest.fn((from, o) => state.ff.filter(m => !(o && o.skipIds && o.skipIds(m.sourceId))).map(m => Object.assign({}, m)))
+    listSince: jest.fn((from, o) => {
+      if (state.ffListCut) {
+        const err = new Error('Fireflies listing incomplete at deadline (3 listed); will retry');
+        err.name = 'FirefliesIncompleteError';
+        throw err;
+      }
+      const list = state.ff.filter(m => !(o && o.skipIds && o.skipIds(m.sourceId)))
+        .sort((a, b) => new Date(a.start) - new Date(b.start));
+      let cut = false;
+      return list.map(m => {
+        if (!cut && o && o.deadline && o.deadline.expired()) cut = true;
+        if (cut) return Object.assign({}, m, { transcript: null, deferred: true, transcriptDeferred: 'deadline' });
+        if (state.ffOnFetch) state.ffOnFetch(m);
+        return Object.assign({}, m);
+      });
+    })
   };
   const CalendarLookup = {
     find: jest.fn(m => {
@@ -153,13 +171,17 @@ function makeFakes(state) {
   const Todoist = {
     createTask: jest.fn(t => {
       if (state.failCreate(t)) throw new Error('Todoist 500');
-      const task = { id: String(9000 + state.tasks.length), content: t.content };
+      const task = { id: String(9000 + state.tasks.length), content: t.content, description: t.description };
       state.tasks.push(task);
       state.open.push(task);
       return task;
     }),
     openTasks: jest.fn(() => state.open),
-    withMachineLine: jest.fn((d, obj) => (d ? d + '\n' : '') + '<!-- ta:' + JSON.stringify(obj) + ' -->')
+    withMachineLine: jest.fn((d, obj) => (d ? d + '\n' : '') + '<!-- ta:' + JSON.stringify(obj) + ' -->'),
+    parseMachineLine: jest.fn(d => {
+      const all = String(d || '').match(/<!-- ta:(\{.*?\}) -->/g);
+      return all ? JSON.parse(all[all.length - 1].slice(8, -4)) : null;
+    })
   };
   return { Granola, Fireflies, CalendarLookup, Route, Dedupe, Extract, Todoist };
 }
@@ -361,38 +383,121 @@ describe('runMeetings — ledger and cursor', () => {
     const third = { id: 'not_later', title: 'Later', updated_at: '2026-09-25T10:00:00Z' };
     ctx.state.notes = [syncList(), newList(), third];
     ctx.state.meetings.not_later = Object.assign(newMeeting(), { key: 'granola:not_later', sourceId: 'not_later', title: 'Later', start: new Date('2026-09-25T09:00:00Z') });
-    ctx.state.items['granola:not_new0924'] = new Error('Claude 529 overloaded');
+    ctx.state.items['granola:not_new0924'] = new Error('emit block missing required field "items"');
     ctx.state.items['granola:not_later'] = [item({ title: 'Email Jon the deck', project: 'GR' })];
     const res = ctx.runMeetings();
     expect(res.errors).toBe(1);
     expect(res.processed).toBe(2);
     expect(ledger(ctx, 'granola:not_new0924')).toMatchObject({ outcome: 'error' });
-    expect(ledger(ctx, 'granola:not_new0924').note).toMatch(/^attempt 1: Claude 529/);
+    expect(ledger(ctx, 'granola:not_new0924').note).toBe('attempt 1 (first 2026-09-25T18:00:00.000Z): emit block missing required field "items"');
     expect(ledger(ctx, 'granola:not_later').outcome).toBe('queued');
     // Cursor stops at the last note before the failed one.
     expect(ctx.Store.kvGet('granola.updatedAfter')).toBe('2026-09-24T16:48:03.000Z');
     expect(runs(ctx)[0].note).toMatch(/granola:not_new0924 failed/);
   });
 
-  test('errored note is retried, and given up after MAX_ATTEMPTS so the cursor moves on', () => {
+  test('meeting-specific failures give up only after MAX_ATTEMPTS over >= 24h, visibly queued', () => {
     let ctx = setup();
     ctx.state.notes = [newList()];
     ctx.state.items['granola:not_new0924'] = new Error('bad JSON');
     ctx.runMeetings();
     expect(ctx.Store.kvGet('granola.updatedAfter')).toBeNull();
-    ctx = next(ctx);
-    ctx.runMeetings();
+    // Runs 2 and 3, ten minutes apart: counted, but not yet given up (time cap).
+    for (let i = 1; i <= 2; i++) {
+      ctx = next(ctx, { now: new Date(NOW.getTime() + i * 600000) });
+      ctx.runMeetings();
+    }
     expect(ctx.fakes.Extract.meeting).toHaveBeenCalledTimes(1);
-    expect(ledger(ctx, 'granola:not_new0924').note).toMatch(/^attempt 2:/);
+    expect(ledger(ctx, 'granola:not_new0924')).toMatchObject({ outcome: 'error' });
+    expect(ledger(ctx, 'granola:not_new0924').note).toMatch(/^attempt 3 \(first 2026-09-25T18:00:00.000Z\): bad JSON/);
     expect(ctx.Store.kvGet('granola.updatedAfter')).toBeNull();
-    ctx = next(ctx);
-    ctx.runMeetings();
-    expect(ledger(ctx, 'granola:not_new0924').note).toMatch(/^attempt 3:/);
-    expect(ctx.Store.kvGet('granola.updatedAfter')).toBe('2026-09-24T19:40:00.000Z');
-    ctx = next(ctx);
+    expect(ctx.Store.queueCount()).toBe(0);
+    // A day later it still fails: give up with a triage item, cursor moves on.
+    ctx = next(ctx, { now: new Date('2026-09-26T18:05:00Z') });
     const res = ctx.runMeetings();
+    expect(res.queued).toBe(1);
+    const l = ledger(ctx, 'granola:not_new0924');
+    expect(l.outcome).toBe('queued');
+    expect(l.note).toMatch(/^gave up after 4 attempts \(first 2026-09-25T18:00:00.000Z\): bad JSON/);
+    const q = ctx.Store.queueList({ status: 'pending' });
+    expect(q).toHaveLength(1);
+    expect(q[0]).toMatchObject({
+      id: l.queueIds[0], source: 'system', sourceKey: 'granola:not_new0924', chips: ['Extraction failed'],
+      title: 'Pull the todos from "New note" by hand', origin: 'Granola · New note · Thu 24 Sep', kind: 'todo'
+    });
+    expect(q[0].why).toMatch(/failed 4 times: bad JSON/);
+    expect(ctx.Store.kvGet('granola.updatedAfter')).toBe('2026-09-24T19:40:00.000Z');
+    ctx = next(ctx, { now: new Date('2026-09-26T18:15:00Z') });
+    const res2 = ctx.runMeetings();
     expect(ctx.fakes.Granola.getNote).not.toHaveBeenCalled();
-    expect(res.skipped).toBe(1);
+    expect(res2.skipped).toBe(1);
+  });
+
+  test('systemic failures (overloaded, 5xx, missing config) never count towards giving up', () => {
+    const overloaded = new Error('HTTP 529 overloaded_error'); overloaded.name = 'HttpError'; overloaded.status = 529;
+    const missing = new Error('Missing Script Property: CLAUDE_MODEL. Set it in Project Settings > Script Properties');
+    const todoistDown = new Error('HTTP 503'); todoistDown.name = 'HttpError'; todoistDown.status = 503;
+    let ctx = setup();
+    ctx.state.notes = [newList()];
+    const errs = [overloaded, missing, todoistDown, overloaded, overloaded];
+    errs.forEach((err, i) => {
+      if (i) ctx = next(ctx, { now: new Date(NOW.getTime() + i * 12 * 3600000) }); // spans 2 days
+      ctx.state.items['granola:not_new0924'] = err;
+      ctx.runMeetings();
+    });
+    const l = ledger(ctx, 'granola:not_new0924');
+    expect(l.outcome).toBe('error');
+    expect(l.note).toMatch(/^transient, attempt 0: HttpError: HTTP 529/);
+    expect(ctx.Store.queueCount()).toBe(0);
+    expect(ctx.Store.kvGet('granola.updatedAfter')).toBeNull();
+    // Service recovers: the note is processed normally.
+    ctx = next(ctx, { now: new Date('2026-09-28T09:00:00Z') });
+    ctx.state.items['granola:not_new0924'] = [item({ title: 'Buy new tyres for the Tacoma', project: 'Me', section: 'Cars' })];
+    const res = ctx.runMeetings();
+    expect(res.errors).toBe(0);
+    expect(ledger(ctx, 'granola:not_new0924').outcome).toBe('queued');
+    expect(ctx.Store.kvGet('granola.updatedAfter')).toBe('2026-09-24T19:40:00.000Z');
+  });
+
+  test('isSystemic_ classification', () => {
+    const ctx = setup();
+    const http = (status) => Object.assign(new Error('HTTP ' + status), { name: 'HttpError', status });
+    [0, 401, 403, 408, 429, 500, 502, 529].forEach(st => expect(ctx.Meetings.isSystemic_(http(st))).toBe(true));
+    [400, 404, 413, 422].forEach(st => expect(ctx.Meetings.isSystemic_(http(st))).toBe(false));
+    expect(ctx.Meetings.isSystemic_(new Error('Your credit balance is too low'))).toBe(true);
+    expect(ctx.Meetings.isSystemic_(new Error('Missing Script Property: CLAUDE_MODEL'))).toBe(true);
+    expect(ctx.Meetings.isSystemic_(new Error('Claude output truncated at max_tokens=4096'))).toBe(false);
+    expect(ctx.Meetings.isSystemic_(null)).toBe(false);
+  });
+
+  test('a queue/ledger write failure after tasks were created records their ids; the retry does not re-create or dup-queue them', () => {
+    const ctx = setup();
+    ctx.state.notes = [syncList()];
+    ctx.state.items['granola:not_sync0924'] = [item(), item({ title: 'Book the design review', confidence: 'med' })];
+    const realAdd = ctx.Store.queueAdd;
+    ctx.Store.queueAdd = () => { throw new Error('Sheets: service unavailable'); };
+    const res = ctx.runMeetings();
+    expect(res.created).toBe(1);
+    const l = ledger(ctx, 'granola:not_sync0924');
+    expect(l).toMatchObject({ outcome: 'error', taskIds: ['9000'] });
+    expect(ctx.Store.kvGet('granola.updatedAfter')).toBeNull();
+    ctx.Store.queueAdd = realAdd;
+
+    // Retry: extractor re-words the first item slightly; neither version is re-created or dup-queued.
+    const again = next(ctx);
+    again.state.items['granola:not_sync0924'] = [
+      item(), item({ title: 'Send Miro the C++ design doc' }), item({ title: 'Book the design review', confidence: 'med' })
+    ];
+    again.fakes.Dedupe.matchTask.mockImplementation((it, tasks) => {
+      const t = tasks.find(x => /design doc/i.test(x.content) && /design doc/i.test(it.title));
+      return t ? { taskId: t.id, title: t.content, score: 0.8 } : null;
+    });
+    const res2 = again.runMeetings();
+    expect(again.fakes.Todoist.createTask).not.toHaveBeenCalled();
+    expect(res2.created).toBe(0);
+    const q = again.Store.queueList();
+    expect(q.map(x => x.title)).toEqual(['Book the design review']);
+    expect(ledger(again, 'granola:not_sync0924')).toMatchObject({ outcome: 'tasks', taskIds: ['9000'], queueIds: [q[0].id] });
   });
 
   test('getNote failure is isolated per note', () => {
@@ -401,7 +506,7 @@ describe('runMeetings — ledger and cursor', () => {
     ctx.state.getError = { not_sync0924: err };
     const res = ctx.runMeetings();
     expect(res.errors).toBe(1);
-    expect(ledger(ctx, 'granola:not_sync0924').note).toMatch(/HttpError: HTTP 500 \(HTTP 500\)/);
+    expect(ledger(ctx, 'granola:not_sync0924').note).toBe('transient, attempt 0: HttpError: HTTP 500 (HTTP 500)');
     expect(ledger(ctx, 'granola:not_new0924').outcome).toBe('queued');
     expect(ctx.Store.kvGet('granola.updatedAfter')).toBeNull();
   });
@@ -567,6 +672,56 @@ describe('runMeetings — Fireflies', () => {
     expect(ledger(ctx, 'fireflies:02NEW')).toBeNull();
   });
 
+  test('recordings Fireflies could not fetch before the deadline stay pending and hold the cursor', () => {
+    const now = new Date('2026-09-28T18:00:00Z');
+    const ctx = setup({ props: { FIREFLIES_API_KEY: 'ff' }, now });
+    ctx.state.notes = [];
+    ctx.Store.kvSet('fireflies.fromDate', '2026-09-24T00:00:00.000Z');
+    const old = Object.assign(ffSync(), { key: 'fireflies:OLD', sourceId: 'OLD', title: 'Old sync', start: new Date('2026-09-25T09:00:00Z') });
+    const neu = Object.assign(ffSync(), { key: 'fireflies:NEW', sourceId: 'NEW', title: 'New sync', start: new Date('2026-09-26T17:00:00Z') });
+    ctx.state.ff = [neu, old]; // listed newest first, as Fireflies does in practice
+    ctx.state.items['fireflies:OLD'] = [item({ title: 'Email the old deck', confidence: 'med' })];
+    ctx.state.items['fireflies:NEW'] = [item({ title: 'Email the new deck', confidence: 'med' })];
+    ctx.state.ffOnFetch = () => ctx.advance(280000); // the first transcript fetch uses up the budget
+    const res = ctx.runMeetings();
+    expect(res.stoppedEarly).toBe(true);
+    expect(ctx.fakes.Extract.meeting).not.toHaveBeenCalled();
+    expect(ledger(ctx, 'fireflies:NEW')).toBeNull();
+    // The cursor never jumps past the unfetched recording.
+    expect(ctx.Store.kvGet('fireflies.fromDate')).toBe('2026-09-25T09:00:00.000Z');
+
+    const later = next(ctx, { now: new Date('2026-09-28T18:10:00Z') });
+    later.state.ffOnFetch = null;
+    later.runMeetings();
+    expect(later.fakes.Extract.meeting).toHaveBeenCalledTimes(2);
+    expect(ledger(later, 'fireflies:OLD').outcome).toBe('queued');
+    expect(ledger(later, 'fireflies:NEW').outcome).toBe('queued');
+    expect(later.Store.kvGet('fireflies.fromDate')).toBe('2026-09-26T17:00:00.000Z');
+  });
+
+  test('Fireflies is skipped entirely once Granola has used the budget', () => {
+    const ctx = setup({ props: { FIREFLIES_API_KEY: 'ff' } });
+    ctx.Store.kvSet('fireflies.fromDate', '2026-09-24T00:00:00.000Z');
+    ctx.fakes.Granola.getNote.mockImplementation(id => { ctx.advance(240000); return Object.assign({}, ctx.state.meetings[id]); });
+    ctx.state.ff = [ffSync()];
+    const res = ctx.runMeetings();
+    expect(ctx.fakes.Fireflies.listSince).not.toHaveBeenCalled();
+    expect(res.stoppedEarly).toBe(true);
+    expect(res.errors).toBe(0);
+    expect(ctx.Store.kvGet('fireflies.fromDate')).toBe('2026-09-24T00:00:00.000Z');
+  });
+
+  test('a Fireflies listing cut at the deadline is not an error and keeps the cursor', () => {
+    const ctx = setup({ props: { FIREFLIES_API_KEY: 'ff' } });
+    ctx.Store.kvSet('fireflies.fromDate', '2026-09-24T00:00:00.000Z');
+    ctx.state.ffListCut = true;
+    const res = ctx.runMeetings();
+    expect(res.errors).toBe(0);
+    expect(res.stoppedEarly).toBe(true);
+    expect(res.processed).toBe(2);
+    expect(ctx.Store.kvGet('fireflies.fromDate')).toBe('2026-09-24T00:00:00.000Z');
+  });
+
   test('Fireflies listing failure is logged; Granola still processed', () => {
     const ctx = setup({ props: { FIREFLIES_API_KEY: 'ff' } });
     ctx.fakes.Fireflies.listSince.mockImplementation(() => { throw new Error('GraphQL down'); });
@@ -620,6 +775,57 @@ describe('runBackfill', () => {
     expect(later.Store.kvGet('backfill.cursor')).toMatchObject({ complete: true, runs: 2 });
     expect(later.__mocks.ScriptApp.__triggers).toHaveLength(0);
     expect(later.Store.queueList()).toHaveLength(2);
+  });
+
+  test('a failed or cut Fireflies listing keeps the backfill window open', () => {
+    const ctx = setup({ props: { FIREFLIES_API_KEY: 'ff' } });
+    ctx.fakes.Fireflies.listSince.mockImplementation(() => { throw new Error('GraphQL down'); });
+    const res = ctx.runBackfill();
+    expect(res.complete).toBe(false);
+    expect(ctx.Store.kvGet('backfill.cursor')).toMatchObject({ complete: false, runs: 1 });
+    expect(ctx.__mocks.ScriptApp.__triggers).toHaveLength(1);
+
+    const later = next(ctx, { now: new Date('2026-09-25T18:02:00Z') });
+    later.state.ff = [ffSync()];
+    const res2 = later.runBackfill();
+    expect(later.fakes.Fireflies.listSince.mock.calls[0][0]).toBe('2026-08-28T18:00:00.000Z');
+    expect(res2.complete).toBe(true);
+    expect(ledger(later, 'fireflies:01FFSYNC')).not.toBeNull();
+    expect(later.__mocks.ScriptApp.__triggers).toHaveLength(0);
+  });
+
+  test('backfill with Fireflies recordings deferred at the deadline is not complete', () => {
+    const ctx = setup({ props: { FIREFLIES_API_KEY: 'ff' } });
+    ctx.state.notes = [];
+    ctx.state.ff = [ffSync(), Object.assign(ffSync(), { key: 'fireflies:02', sourceId: '02', title: 'Other', start: new Date('2026-09-20T10:00:00Z') })];
+    ctx.state.ffOnFetch = () => ctx.advance(280000);
+    const res = ctx.runBackfill();
+    expect(res.complete).toBe(false);
+    expect(ctx.__mocks.ScriptApp.__triggers).toHaveLength(1);
+  });
+
+  test('stops re-arming after BACKFILL_MAX_RUNS', () => {
+    const ctx = setup({ props: { FIREFLIES_API_KEY: 'ff' } });
+    ctx.Store.kvSet('backfill.cursor', { from: '2026-08-28T18:00:00.000Z', to: NOW.toISOString(), startedAt: NOW.toISOString(), runs: 29, complete: false });
+    ctx.fakes.Fireflies.listSince.mockImplementation(() => { throw new Error('bad key'); });
+    const res = ctx.runBackfill();
+    expect(res.complete).toBe(false);
+    expect(ctx.__mocks.ScriptApp.__triggers).toHaveLength(0);
+    expect(res.note).toMatch(/still incomplete after 30 runs/);
+  });
+
+  test('lock busy: the continuation is re-armed instead of silently dropped', () => {
+    const ctx = setup();
+    ctx.Store.kvSet('backfill.cursor', { from: '2026-08-28T18:00:00.000Z', to: NOW.toISOString(), runs: 1, complete: false });
+    ctx.__mocks.LockService.__available = false;
+    expect(ctx.runBackfill()).toBeNull();
+    expect(ctx.fakes.Granola.listNotes).not.toHaveBeenCalled();
+    const trig = ctx.__mocks.ScriptApp.__triggers;
+    expect(trig).toHaveLength(1);
+    expect(trig[0].__config).toMatchObject({ handler: 'runBackfill', after: 60000 });
+    // Firing again while still busy replaces rather than piles up triggers.
+    ctx.runBackfill();
+    expect(ctx.__mocks.ScriptApp.__triggers).toHaveLength(1);
   });
 
   test('a completed backfill starts a new window next time', () => {

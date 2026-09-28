@@ -9,7 +9,10 @@
  *
  * Guarantees
  * - Ledger: every processed source key (both keys when Granola + Fireflies merged) is ledgered with
- *   outcome tasks|queued|nothing, or error (retried up to MAX_ATTEMPTS, then given up and logged).
+ *   outcome tasks|queued|nothing, or error (retried every run). Only meeting-specific failures count
+ *   towards MAX_ATTEMPTS (outages/config errors never do); giving up needs MAX_ATTEMPTS failures over
+ *   at least GIVE_UP_MS and queues an "Extraction failed" triage item, so nothing is dropped silently.
+ * - Retries are idempotent: tasks a failed attempt already created are found by their machine line.
  * - Cursor `granola.updatedAfter` only advances over a contiguous run (by updated_at) of fully
  *   processed notes, and never when the listing itself was cut short by the deadline.
  * - One failing meeting (or item) is logged and counted; the run carries on.
@@ -20,8 +23,14 @@
 const Meetings = {
   /** Stop starting new meetings when less than this much of the budget is left (an LLM call). */
   RESERVE_MS: 45000,
-  /** Give up on a note after this many failed attempts (ledger stays 'error'; cursor moves on). */
+  /**
+   * Give up on a meeting after this many meeting-specific failures spanning at least GIVE_UP_MS
+   * (systemic failures never count). Giving up queues an "Extraction failed" item for triage.
+   */
   MAX_ATTEMPTS: 3,
+  GIVE_UP_MS: 24 * 3600 * 1000,
+  /** A backfill window stops re-arming its continuation trigger after this many runs. */
+  BACKFILL_MAX_RUNS: 30,
   /** Default look-back for the first incremental run. */
   FIRST_RUN_DAYS: 2,
   /** A Fireflies-only recording younger than this (from its start) waits for its Granola twin. */
@@ -116,35 +125,62 @@ const Meetings = {
         meetings.push(m);
         noteState[n.id] = 'pending';
       } catch (e) {
-        noteState[n.id] = Meetings.recordError_([key], e, stats) ? 'done' : 'pending';
+        noteState[n.id] = Meetings.recordError_([key], e, stats, {
+          source: 'granola', title: n.title, start: n.created_at, key: key
+        }) ? 'done' : 'pending';
       }
     });
 
     // 2. Fireflies (backup source).
-    let ffMeetings = [];
+    // ffFrom stays null (cursor untouched) unless the listing ran and was complete; ffIncomplete
+    // keeps a backfill window open when Fireflies was skipped, cut short or failed.
+    const ffMeetings = [];
     let ffFrom = null;
+    let ffIncomplete = false;
+    let ffCut = false;
+    const ffPending = []; // Fireflies meetings left for later (start times drive the cursor)
     if (Meetings.firefliesEnabled_()) {
-      ffFrom = ctx.backfill ? window.from
-        : (Store.kvGet(Meetings.KV_FIREFLIES, null) || Util.addDays(now, -Meetings.FIRST_RUN_DAYS).toISOString());
-      try {
-        ffMeetings = Fireflies.listSince(ffFrom, {
-          toDate: ctx.backfill ? window.to : undefined,
-          deadline: ctx.deadline,
-          skipIds: function (id) { return Meetings.alreadyDone_('fireflies:' + id, null); }
-        }) || [];
-        stats.seen += ffMeetings.length;
-      } catch (e) {
-        stats.errors++;
-        stats.notes.push('fireflies listing failed: ' + Meetings.errText_(e));
-        console.log('[' + stats.job + '] Fireflies listing failed: ' + Meetings.errText_(e));
-        ffFrom = null; // do not move the Fireflies cursor
+      if (Meetings.outOfTime_(ctx.deadline)) {
+        // Granola already used the budget: do not spend what is left fetching transcripts
+        // that the merge loop would throw away. Cursor stays; next run lists again.
+        ffIncomplete = true;
+        ffCut = true;
+      } else {
+        const from = ctx.backfill ? window.from
+          : (Store.kvGet(Meetings.KV_FIREFLIES, null) || Util.addDays(now, -Meetings.FIRST_RUN_DAYS).toISOString());
+        try {
+          const listed = Fireflies.listSince(from, {
+            toDate: ctx.backfill ? window.to : undefined,
+            deadline: ctx.deadline,
+            skipIds: function (id) { return Meetings.alreadyDone_('fireflies:' + id, null); }
+          }) || [];
+          stats.seen += listed.length;
+          // Fireflies.listSince returns the recordings it could not fetch before the deadline with
+          // `deferred: true` (transcript not loaded). They are pending: never processed this run,
+          // and they hold the cursor at or before their start.
+          listed.forEach(function (m) {
+            if (m && m.deferred) { ffPending.push(m); ffCut = true; } else if (m) ffMeetings.push(m);
+          });
+          if (ffCut) ffIncomplete = true;
+          ffFrom = from;
+        } catch (e) {
+          ffIncomplete = true;
+          if (e && e.name === 'FirefliesIncompleteError') {
+            // Listing itself cut at the deadline: not an error, just resume next run.
+            ffCut = true;
+            console.log('[' + stats.job + '] ' + Meetings.errText_(e));
+          } else {
+            stats.errors++;
+            stats.notes.push('fireflies listing failed: ' + Meetings.errText_(e));
+            console.log('[' + stats.job + '] Fireflies listing failed: ' + Meetings.errText_(e));
+          }
+        }
       }
     }
 
     // 3. Merge across sources.
     const merged = Dedupe.mergeMeetings(meetings.concat(ffMeetings)) || [];
     const recent = Meetings.recentLoad_(now);
-    const ffPending = []; // Fireflies-only meetings left for later (start times)
     let stopped = false;
 
     merged.forEach(function (m) {
@@ -177,12 +213,12 @@ const Meetings = {
         Meetings.markDone_(keys, noteState);
         recent.push(Meetings.fingerprint_(m));
       } catch (e) {
-        if (Meetings.recordError_(keys, e, stats)) Meetings.markDone_(keys, noteState);
+        if (Meetings.recordError_(keys, e, stats, m)) Meetings.markDone_(keys, noteState);
         else if (m.source === 'fireflies') ffPending.push(m);
       }
     });
 
-    stats.stoppedEarly = stopped || fetchCut || listingCut;
+    stats.stoppedEarly = stopped || fetchCut || listingCut || ffCut;
     if (stats.stoppedEarly) stats.notes.push('stopped at deadline; will resume');
     if (stats.deferred) stats.notes.push(stats.deferred + ' Fireflies-only meeting(s) waiting for Granola');
 
@@ -192,14 +228,20 @@ const Meetings = {
     if (ctx.backfill) {
       window.runs = (window.runs || 0) + 1;
       const allDone = !stats.stoppedEarly && notes.every(function (n) { return noteState[n.id] === 'done'; }) &&
-        !ffPending.length;
+        !ffPending.length && !ffIncomplete;
       window.complete = allDone;
       if (allDone) window.completedAt = now.toISOString();
       Store.kvSet(Meetings.KV_BACKFILL, window);
       stats.complete = allDone;
       stats.cursor = window;
-      if (!allDone) stats.notes.push('backfill incomplete (run ' + window.runs + ')');
-      Meetings.scheduleContinuation_(!allDone);
+      let more = !allDone;
+      if (more && window.runs >= Meetings.BACKFILL_MAX_RUNS) {
+        more = false;
+        stats.notes.push('backfill still incomplete after ' + window.runs + ' runs; not re-arming — check the errors and run runBackfill again');
+      } else if (!allDone) {
+        stats.notes.push('backfill incomplete (run ' + window.runs + ')');
+      }
+      Meetings.scheduleContinuation_(more);
       return;
     }
 
@@ -252,9 +294,18 @@ const Meetings = {
     const queueIds = [];
     let itemErrors = 0;
 
+    // Tasks an earlier, failed attempt at this meeting already created (machine line key/q), so a
+    // retry neither re-creates them nor queues them as "duplicates" of Alex's own new tasks.
+    const ownEarlier = Meetings.ownTasks_(openTasks, keys);
+
     items.forEach(function (item) {
       if (!item || !item.title) return;
       const qid = Store.queueId('meeting', m.key, item.title);
+      const mine = ownEarlier.byQ[qid];
+      if (mine) {
+        if (taskIds.indexOf(mine) < 0) taskIds.push(mine);
+        return;
+      }
       const fin = Route.finalize(route, item, catalogue) || { project: null, section: null, routeConfidence: 'low' };
       // 7. Existing-task match.
       let dup = null;
@@ -262,6 +313,12 @@ const Meetings = {
         dup = Dedupe.matchTask({ id: qid, title: item.title }, openTasks, notDup);
       } catch (e) {
         console.log('[meetings] dedupe failed for "' + Util.truncate(item.title, 60) + '": ' + Meetings.errText_(e));
+      }
+      if (dup && ownEarlier.ids[String(dup.taskId)]) {
+        // Same item as a task this meeting produced on an earlier attempt (title re-worded by the
+        // extractor): already captured.
+        if (taskIds.indexOf(String(dup.taskId)) < 0) taskIds.push(String(dup.taskId));
+        return;
       }
       // 8. Decision.
       const reason = Meetings.decide_(item, fin, dup, ctx.backfill);
@@ -290,24 +347,31 @@ const Meetings = {
       queueItems.push(Meetings.queueItem_(m, item, fin, dup, qid, ctx.backfill, []));
     });
 
-    if (queueItems.length) {
-      const added = Store.queueAdd(queueItems) || [];
-      stats.queued += added.length;
-      queueItems.forEach(function (q) { queueIds.push(q.id); });
-    }
+    // Past this point tasks may exist in Todoist: a failure must carry their ids into the error
+    // ledger entry (recordError_ reads e.partialTaskIds), and the retry recognises them above.
+    try {
+      if (queueItems.length) {
+        const added = Store.queueAdd(queueItems) || [];
+        stats.queued += added.length;
+        queueItems.forEach(function (q) { queueIds.push(q.id); });
+      }
 
-    // 9. Ledger every source key of this meeting.
-    const outcome = taskIds.length ? 'tasks' : queueIds.length ? 'queued' : 'nothing';
-    const noteBits = [];
-    if (items.length) noteBits.push(items.length + ' item(s)');
-    if (itemErrors) noteBits.push(itemErrors + ' create error(s)');
-    if (ctx.backfill) noteBits.push('backfill');
-    Store.ledgerPutMany(keys.map(function (k, i) {
-      const bits = noteBits.slice();
-      if (i > 0) bits.unshift('merged into ' + keys[0]);
-      return { key: k, outcome: outcome, taskIds: taskIds, queueIds: queueIds, note: bits.join('; ') };
-    }));
-    return { outcome: outcome, taskIds: taskIds, queueIds: queueIds };
+      // 9. Ledger every source key of this meeting.
+      const outcome = taskIds.length ? 'tasks' : queueIds.length ? 'queued' : 'nothing';
+      const noteBits = [];
+      if (items.length) noteBits.push(items.length + ' item(s)');
+      if (itemErrors) noteBits.push(itemErrors + ' create error(s)');
+      if (ctx.backfill) noteBits.push('backfill');
+      Store.ledgerPutMany(keys.map(function (k, i) {
+        const bits = noteBits.slice();
+        if (i > 0) bits.unshift('merged into ' + keys[0]);
+        return { key: k, outcome: outcome, taskIds: taskIds, queueIds: queueIds, note: bits.join('; ') };
+      }));
+      return { outcome: outcome, taskIds: taskIds, queueIds: queueIds };
+    } catch (e) {
+      if (taskIds.length && e && typeof e === 'object') e.partialTaskIds = taskIds.slice();
+      throw e;
+    }
   },
 
   /**
@@ -444,6 +508,23 @@ const Meetings = {
     return out;
   },
 
+  /**
+   * Open tasks whose machine line says this meeting (any of its keys) created them.
+   * @return {{byQ: Object<string,string>, ids: Object<string,boolean>}} qid -> task id; task id set
+   */
+  ownTasks_(openTasks, keys) {
+    const out = { byQ: {}, ids: {} };
+    (openTasks || []).forEach(function (t) {
+      if (!t || !t.description) return;
+      let ml = null;
+      try { ml = Todoist.parseMachineLine(t.description); } catch (e) { ml = null; }
+      if (!ml || keys.indexOf(ml.key) < 0) return;
+      out.ids[String(t.id)] = true;
+      if (ml.q) out.byQ[ml.q] = String(t.id);
+    });
+    return out;
+  },
+
   // ------------------------------------------------------------------ ledger / cursor helpers
 
   keysOf_(m) {
@@ -453,42 +534,127 @@ const Meetings = {
   },
 
   /**
-   * True if `key` needs no work: in the ledger with a non-error outcome, or errored MAX_ATTEMPTS
-   * times (given up). Counts a skip when stats is passed.
+   * True if `key` needs no work: in the ledger with a non-error outcome (a given-up meeting is
+   * ledgered 'queued' with its "Extraction failed" queue item). Counts a skip when stats is passed.
    */
   alreadyDone_(key, stats) {
     if (Store.ledgerHas(key)) { if (stats) stats.skipped++; return true; }
-    const e = Store.ledgerGet(key);
-    if (e && e.outcome === 'error' && Meetings.attempts_(e) >= Meetings.MAX_ATTEMPTS) {
-      if (stats) stats.skipped++;
-      return true;
-    }
     return false;
   },
 
+  /** Counted (meeting-specific) failures so far, from the ledger note "attempt N …". */
   attempts_(entry) {
-    const m = /attempt (\d+)/.exec(String((entry && entry.note) || ''));
-    return m ? parseInt(m[1], 10) : (entry && entry.outcome === 'error' ? 1 : 0);
+    if (!entry || entry.outcome !== 'error') return 0;
+    const m = /attempt (\d+)/.exec(String(entry.note || ''));
+    return m ? parseInt(m[1], 10) : 1;
+  },
+
+  /** When the first counted failure happened (ledger note "… first <ISO> …"), or null. */
+  firstFailure_(entry) {
+    if (!entry || entry.outcome !== 'error') return null;
+    const m = /first (\d{4}-\d\d-\d\dT[\d:.]+Z)/.exec(String(entry.note || ''));
+    return m ? Util.parseDate(m[1]) : null;
   },
 
   /**
-   * Ledger an error for every key. Returns true when the meeting has now failed MAX_ATTEMPTS times
-   * (given up: treated as done for the cursor).
+   * True for failures that say nothing about this meeting: the service or our config is down
+   * (network, 401/403/408/429/5xx/529, overloaded, credits, missing Script Property). They are
+   * ledgered as errors (retried) but do NOT count towards MAX_ATTEMPTS, so an outage never makes
+   * us give up on the notes in its window.
    */
-  recordError_(keys, e, stats) {
+  isSystemic_(e) {
+    if (!e) return false;
+    const status = Number(e.status);
+    if (e.name === 'HttpError' && (status === 0 || status === 401 || status === 403 || status === 408 ||
+      status === 429 || status >= 500)) return true;
+    const msg = String(e.message || e);
+    return /Missing Script Property|overloaded|rate.?limit|credit balance|timed? ?out|Service invoked too many times|Exceeded maximum execution time|Address unavailable|DNS error/i.test(msg);
+  },
+
+  /**
+   * Ledger an error for every key. Meeting-specific failures count an attempt; systemic ones
+   * (isSystemic_) do not. After MAX_ATTEMPTS counted failures spanning at least GIVE_UP_MS, the
+   * meeting is given up VISIBLY: a queue item "Pull the todos from <title> by hand" (chip
+   * "Extraction failed", link to the source) is added and the keys are ledgered 'queued' with
+   * it. Returns true when given up (treated as done for the cursor).
+   * @param {string[]} keys source keys of the meeting
+   * @param {Error} e
+   * @param {Object} stats
+   * @param {{title?, start?, url?, source?, key?}} [info] meeting (or listing) data for the queue item
+   */
+  recordError_(keys, e, stats, info) {
     stats.errors++;
     const msg = Meetings.errText_(e);
-    let gaveUp = false;
-    const entries = keys.map(function (k) {
+    const systemic = Meetings.isSystemic_(e);
+    const now = Util.now();
+    const partialTaskIds = (e && e.partialTaskIds) || [];
+    let n = 0;
+    let first = null;
+    keys.forEach(function (k) {
       const prev = Store.ledgerGet(k);
-      const n = (prev && prev.outcome === 'error' ? Meetings.attempts_(prev) : 0) + 1;
-      if (n >= Meetings.MAX_ATTEMPTS) gaveUp = true;
-      return { key: k, outcome: 'error', note: 'attempt ' + n + ': ' + Util.truncate(msg, 300) };
+      n = Math.max(n, Meetings.attempts_(prev));
+      const f = Meetings.firstFailure_(prev);
+      if (f && (!first || f < first)) first = f;
+    });
+    if (!systemic) n++;
+    if (n > 0 && !first) first = now;
+    const gaveUp = !systemic && n >= Meetings.MAX_ATTEMPTS &&
+      now.getTime() - first.getTime() >= Meetings.GIVE_UP_MS;
+
+    if (gaveUp) {
+      try {
+        const q = Meetings.failedQueueItem_(keys, info || {}, n, msg, stats.job === 'backfill');
+        Store.queueAdd([q]);
+        stats.queued++;
+        Store.ledgerPutMany(keys.map(function (k) {
+          return {
+            key: k, outcome: 'queued', taskIds: partialTaskIds, queueIds: [q.id],
+            note: 'gave up after ' + n + ' attempts (first ' + first.toISOString() + '): ' + Util.truncate(msg, 250)
+          };
+        }));
+        console.log('[' + stats.job + '] ' + keys.join(' + ') + ' failed: ' + msg + ' (gave up; queued for manual review)');
+        stats.notes.push(keys[0] + ' gave up after ' + n + ' attempts (queued for review): ' + Util.truncate(msg, 120));
+        return true;
+      } catch (e3) {
+        // Could not make it visible: keep it as an error so it is retried rather than dropped.
+        console.log('[meetings] could not queue the failed meeting: ' + Meetings.errText_(e3));
+      }
+    }
+
+    const label = systemic ? 'transient, attempt ' + n : 'attempt ' + n;
+    const when = first ? ' (first ' + first.toISOString() + ')' : '';
+    const entries = keys.map(function (k) {
+      return { key: k, outcome: 'error', taskIds: partialTaskIds, note: label + when + ': ' + Util.truncate(msg, 300) };
     });
     try { Store.ledgerPutMany(entries); } catch (e2) { console.log('[meetings] ledger write failed: ' + Meetings.errText_(e2)); }
-    console.log('[' + stats.job + '] ' + keys.join(' + ') + ' failed: ' + msg + (gaveUp ? ' (giving up)' : ''));
-    stats.notes.push(keys[0] + ' failed' + (gaveUp ? ' (gave up)' : '') + ': ' + Util.truncate(msg, 120));
-    return gaveUp;
+    console.log('[' + stats.job + '] ' + keys.join(' + ') + ' failed (' + label + '): ' + msg);
+    stats.notes.push(keys[0] + ' failed (' + label + '): ' + Util.truncate(msg, 120));
+    return false;
+  },
+
+  /** The triage item that stands in for a meeting we gave up extracting. */
+  failedQueueItem_(keys, info, attempts, msg, backfill) {
+    const key = keys[0];
+    const source = info.source || String(key).split(':')[0];
+    const title = info.title || 'Untitled meeting';
+    const start = Util.parseDate(info.start);
+    const chips = ['Extraction failed'];
+    if (backfill) chips.push('Backfill');
+    return {
+      id: Store.queueId('system', key, 'Extraction failed'),
+      status: 'pending',
+      source: 'system',
+      sourceKey: key,
+      origin: (Meetings.SOURCE_LABEL_[source] || source) + ' · ' + title + (start ? ' · ' + Util.formatDay(start) : ''),
+      link: info.url || null,
+      title: Util.truncate('Pull the todos from "' + title + '" by hand', 120),
+      quote: '',
+      why: 'Automatic extraction failed ' + attempts + ' times: ' + Util.truncate(msg, 200),
+      kind: 'todo', due: null, resurface: null, waitOn: null, waitOnEmail: null,
+      project: null, section: null, confidence: 'low', routeConfidence: 'low',
+      dupTaskId: null, dupTaskTitle: null,
+      chips: chips
+    };
   },
 
   markDone_(keys, noteState) {
@@ -667,7 +833,16 @@ function runMeetings() {
  * window starts only after the previous one completed; a one-off trigger continues unfinished work.
  */
 function runBackfill() {
-  return Util.withLock('runBackfill', function () {
+  let ran = false;
+  const res = Util.withLock('runBackfill', function () {
+    ran = true;
     return Meetings.run({ backfill: true });
   });
+  if (!ran) {
+    // Lock busy (usually runMeetings): retry in a minute rather than silently breaking the
+    // continuation chain (or ignoring a manual start).
+    console.log('[backfill] lock busy; retrying in 1 min');
+    Meetings.scheduleContinuation_(true);
+  }
+  return res;
 }
